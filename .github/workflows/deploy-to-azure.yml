@@ -28,7 +28,7 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: ${{ env.PYTHON_VERSION }}
-        cache: 'pip' # Activa caché para acelerar instalación de dependencias en futuras ejecuciones
+        cache: 'pip' # Activa caché para acelerar instalación de dependencias en futuras ejecuciones (eliminar si el warning de caché molesta)
 
     # 3. Autentica con Azure usando el Service Principal
     #    El secreto AZURE_CREDENTIALS debe contener el JSON con clientId, clientSecret, tenantId, subscriptionId
@@ -41,15 +41,19 @@ jobs:
     #    Utiliza la acción de Azure Functions, que empaqueta el código y lo sube.
     #    Confía en Oryx (el sistema de build de Azure) para instalar las dependencias
     #    listadas en requirements.txt directamente en Azure.
+    #    Se añade linuxFxVersion para ayudar a Oryx a detectar el runtime correcto.
     - name: Deploy to Azure Functions
       uses: azure/functions-action@v1
-      id: deploy-to-function-app # ID para referenciar este paso si fuera necesario
+      id: deploy-to-function-app
       with:
         app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }} # Nombre de la app destino
         package: ${{ env.FUNCTION_APP_PATH }}      # Carpeta que contiene el código a empaquetar y desplegar
-        # NO se especifican 'python-version' ni 'app-settings' aquí porque no son inputs válidos para esta acción
-        # Las App Settings deben estar configuradas directamente en Azure Portal o mediante otros métodos (CLI, ARM, etc.)
-        # La versión de Python se configura en el Function App de Azure
+        # Añadimos app-settings solo con lo esencial para el runtime
+        app-settings: |
+          [
+            {"name": "FUNCTIONS_WORKER_RUNTIME", "value": "python", "slotSetting": false},
+            {"name": "linuxFxVersion", "value": "Python|${{ env.PYTHON_VERSION }}", "slotSetting": false}
+          ]
 
     # 5. Cierra la sesión de Azure (buena práctica)
     - name: Azure logout
