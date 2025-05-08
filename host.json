@@ -1,0 +1,23 @@
+{
+	"version": "2.0", // Estándar
+	"logging": {      // Configuración de logs, nivel "Information" está bien
+	  "logLevel": {
+		"Default": "Information" 
+	  },
+	  "applicationInsights": { // Configuración de App Insights (OK para local)
+		"samplingSettings": {
+		  "isEnabled": true,
+		  "excludedTypes": "Request" 
+		}
+	  }
+	},
+	"extensionBundle": { // Bundle de extensiones necesario (OK)
+	  "id": "Microsoft.Azure.Functions.ExtensionBundle",
+	  "version": "[4.*, 5.0.0)" 
+	},
+	"extensions": {
+	  "http": {
+		"routePrefix": "" // Prefijo de ruta vacío (¡Importante!)
+	  }
+	}
+  }

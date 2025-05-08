@@ -1,0 +1,21 @@
+{
+	"scriptFile": "__init__.py", // El código está en __init__.py
+	"bindings": [
+	  {
+		"authLevel": "function", // Nivel de autenticación (clave requerida en Azure)
+								// Nota: Localmente 'func start' suele saltarse esta verificación.
+		"type": "httpTrigger",  // Tipo de trigger: HTTP
+		"direction": "in",      // Dirección: Entrada (recibe datos)
+		"name": "req",          // Nombre de la variable de entrada en Python
+		"methods": [
+		  "post"                // Solo acepta método POST
+		],
+		"route": "dynamics"     // Ruta para llamar a esta función (/api/dynamics)
+	  },
+	  {
+		"type": "http",         // Tipo de binding: HTTP
+		"direction": "out",     // Dirección: Salida (devuelve datos)
+		"name": "$return"       // El valor de retorno de la función Python es la respuesta
+	  }
+	]
+  }
