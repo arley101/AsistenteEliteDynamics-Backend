@@ -5,72 +5,54 @@ name: Deploy EliteDynamicsPro Function App to Azure
 on:
   push:
     branches:
-      - main
-  workflow_dispatch:
+      - main # Se ejecuta cuando haces push a la rama main
+  workflow_dispatch: # Permite ejecución manual desde la pestaña Actions
 
 env:
-  AZURE_FUNCTIONAPP_NAME: EliteDynamicsFuncions
-  PYTHON_VERSION: '3.11' # Asegúrate que coincida con Azure
-  FUNCTION_APP_PATH: '.'   # Ruta a la raíz del proyecto
+  AZURE_FUNCTIONAPP_NAME: EliteDynamicsFuncions   # Nombre exacto de tu Function App en Azure
+  PYTHON_VERSION: '3.11'                         # Versión de Python (asegúrate que coincida con Azure)
+  FUNCTION_APP_PATH: '.'                         # Ruta a la raíz de tu proyecto donde está host.json
 
 jobs:
   build-and-deploy:
-    runs-on: ubuntu-latest
-    # environment: production # Puedes quitarlo si usas secretos de repositorio
+    runs-on: ubuntu-latest # Ejecuta en un runner Linux de GitHub
+    # environment: production # Puedes descomentar si usas entornos y secretos específicos para 'production' en GitHub
 
     steps:
+    # 1. Descarga el código de tu repositorio
     - name: Checkout repository content
       uses: actions/checkout@v4
 
+    # 2. Configura la versión de Python especificada en el runner
     - name: Setup Python version
       uses: actions/setup-python@v5
       with:
         python-version: ${{ env.PYTHON_VERSION }}
-        cache: 'pip' # Buena idea mantener el caché de pip
+        cache: 'pip' # Activa caché para acelerar instalación de dependencias en futuras ejecuciones
 
-    # --- PASO "Install dependencies" ELIMINADO ---
-
+    # 3. Autentica con Azure usando el Service Principal
+    #    El secreto AZURE_CREDENTIALS debe contener el JSON con clientId, clientSecret, tenantId, subscriptionId
     - name: Login via Azure Credentials
       uses: azure/login@v2
       with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }} # Asume secreto correcto
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+    # 4. Despliega el código a Azure Functions
+    #    Utiliza la acción de Azure Functions, que empaqueta el código y lo sube.
+    #    Confía en Oryx (el sistema de build de Azure) para instalar las dependencias
+    #    listadas en requirements.txt directamente en Azure.
     - name: Deploy to Azure Functions
       uses: azure/functions-action@v1
-      id: deploy-to-function-app
+      id: deploy-to-function-app # ID para referenciar este paso si fuera necesario
       with:
-        app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
-        package: ${{ env.FUNCTION_APP_PATH }} # Despliega desde la raíz
-        python-version: ${{ env.PYTHON_VERSION }} # Informa a Azure qué versión esperar
-        # NO incluimos scm-do-build-during-deployment, usa default 'true'
-        app-settings: | # Asegúrate que TODOS los secretos referenciados aquí existan en GitHub
-          [
-            {"name": "FUNCTIONS_WORKER_RUNTIME", "value": "python", "slotSetting": false},
-            {"name": "AzureWebJobsStorage", "value": "${{ secrets.AZURE_WEBJOBS_STORAGE }}", "slotSetting": false},
-            {"name": "CLIENT_ID", "value": "${{ secrets.AZURE_CLIENT_ID }}", "slotSetting": false},
-            {"name": "CLIENT_SECRET", "value": "${{ secrets.AZURE_CLIENT_SECRET }}", "slotSetting": true},
-            {"name": "TENANT_ID", "value": "${{ secrets.AZURE_TENANT_ID }}", "slotSetting": false},
-            {"name": "AZURE_SUBSCRIPTION_ID", "value": "${{ secrets.AZURE_SUBSCRIPTION_ID }}", "slotSetting": false},
-            {"name": "GRAPH_SCOPE", "value": "${{ secrets.GRAPH_SCOPE || 'https://graph.microsoft.com/.default' }}", "slotSetting": false},
-            {"name": "GRAPH_API_ENDPOINT", "value": "${{ secrets.GRAPH_API_ENDPOINT || 'https://graph.microsoft.com/v1.0' }}", "slotSetting": false},
-            {"name": "AZURE_OPENAI_ENDPOINT", "value": "${{ secrets.AZURE_OPENAI_ENDPOINT }}", "slotSetting": false},
-            {"name": "AZURE_OPENAI_API_VERSION", "value": "${{ secrets.AZURE_OPENAI_API_VERSION || '2024-02-15-preview' }}", "slotSetting": false},
-            {"name": "AZURE_OPENAI_SCOPE", "value": "${{ secrets.AZURE_OPENAI_SCOPE || 'https://cognitiveservices.azure.com/.default' }}", "slotSetting": false},
-            {"name": "PBI_CLIENT_ID", "value": "${{ secrets.PBI_CLIENT_ID }}", "slotSetting": false},
-            {"name": "PBI_CLIENT_SECRET", "value": "${{ secrets.PBI_CLIENT_SECRET }}", "slotSetting": true},
-            {"name": "PBI_TENANT_ID", "value": "${{ secrets.PBI_TENANT_ID || secrets.AZURE_TENANT_ID }}", "slotSetting": false},
-            {"name": "GITHUB_PAT", "value": "${{ secrets.GITHUB_PAT }}", "slotSetting": true},
-            {"name": "AZURE_CLIENT_ID_MGMT", "value": "${{ secrets.AZURE_CLIENT_ID_MGMT || secrets.AZURE_CLIENT_ID }}", "slotSetting": false},
-            {"name": "AZURE_CLIENT_SECRET_MGMT", "value": "${{ secrets.AZURE_CLIENT_SECRET_MGMT || secrets.AZURE_CLIENT_SECRET }}", "slotSetting": true},
-            {"name": "AZURE_RESOURCE_GROUP", "value": "${{ secrets.AZURE_RESOURCE_GROUP }}", "slotSetting": false},
-            {"name": "SHAREPOINT_MEMORY_LIST_NAME", "value": "${{ secrets.SHAREPOINT_MEMORY_LIST_NAME || 'AsistenteMemoriaPersistente' }}", "slotSetting": false},
-            {"name": "DEFAULT_API_TIMEOUT", "value": "${{ secrets.DEFAULT_API_TIMEOUT || '60' }}", "slotSetting": false},
-            {"name": "APP_NAME", "value": "EliteDynamicsPro", "slotSetting": false},
-            {"name": "DELEGATED_USER", "value": "${{ secrets.DELEGATED_USER }}", "slotSetting": false},
-            {"name": "DELEGATED_PASS", "value": "${{ secrets.DELEGATED_PASS }}", "slotSetting": true}
-          ]
+        app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }} # Nombre de la app destino
+        package: ${{ env.FUNCTION_APP_PATH }}      # Carpeta que contiene el código a empaquetar y desplegar
+        # NO se especifican 'python-version' ni 'app-settings' aquí porque no son inputs válidos para esta acción
+        # Las App Settings deben estar configuradas directamente en Azure Portal o mediante otros métodos (CLI, ARM, etc.)
+        # La versión de Python se configura en el Function App de Azure
 
+    # 5. Cierra la sesión de Azure (buena práctica)
     - name: Azure logout
       run: |
         az logout
-      if: always()
+      if: always() # Se ejecuta siempre, incluso si el despliegue falla
