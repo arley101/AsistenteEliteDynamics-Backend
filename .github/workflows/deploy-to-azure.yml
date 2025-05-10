@@ -27,9 +27,9 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: ${{ env.PYTHON_VERSION }}
-        # cache: 'pip' # Podemos quitar el caché por ahora para evitar el warning
+        # cache: 'pip' # Cache opcional, puedes quitarlo para evitar warnings si no hay más pip install
 
-    # --- AÑADIR ESTE NUEVO PASO PARA INSTALAR DEPENDENCIAS ---
+    # --- PASO PARA INSTALAR DEPENDENCIAS EN .python_packages ---
     - name: Install Python dependencies
       run: |
         python -m venv ${{ env.PYTHON_PACKAGE_PATH }}
@@ -49,11 +49,11 @@ jobs:
       with:
         app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
         package: ${{ env.FUNCTION_APP_PATH }} # La acción empaquetará desde aquí, incluyendo .python_packages
-        # --- AJUSTAR ESTOS PARÁMETROS PARA DESACTIVAR BUILD REMOTO ---
+        # --- PARÁMETROS PARA DESACTIVAR BUILD REMOTO EN AZURE ---
         scm-do-build-during-deployment: false
         enable-oryx-build: false
         # -------------------------------------------------------------
-        # NO app-settings aquí, ya están en Azure
+        # NO app-settings aquí, confiamos en las que están en Azure Portal
 
     - name: Azure logout
       run: |
