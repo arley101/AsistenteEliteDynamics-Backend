@@ -11,7 +11,8 @@ on:
 env:
   AZURE_FUNCTIONAPP_NAME: EliteDynamicsFuncions
   PYTHON_VERSION: '3.11'
-  FUNCTION_APP_PATH: '.'
+  FUNCTION_APP_PATH: '.' # Asume que tu código está en la raíz del repo
+  PYTHON_PACKAGE_PATH: '.python_packages' # Carpeta donde se instalarán las dependencias
 
 jobs:
   build-and-deploy:
@@ -26,7 +27,16 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: ${{ env.PYTHON_VERSION }}
-        # cache: 'pip' # Puedes dejarlo o quitarlo, no es crítico ahora
+        # cache: 'pip' # Podemos quitar el caché por ahora para evitar el warning
+
+    # --- AÑADIR ESTE NUEVO PASO PARA INSTALAR DEPENDENCIAS ---
+    - name: Install Python dependencies
+      run: |
+        python -m venv ${{ env.PYTHON_PACKAGE_PATH }}
+        source ${{ env.PYTHON_PACKAGE_PATH }}/bin/activate
+        python -m pip install --upgrade pip
+        pip install -r ${{ env.FUNCTION_APP_PATH }}/requirements.txt --target="${{ env.PYTHON_PACKAGE_PATH }}/lib/python${{ env.PYTHON_VERSION }}/site-packages"
+    # ----------------------------------------------------------
 
     - name: Login via Azure Credentials
       uses: azure/login@v2
@@ -38,11 +48,12 @@ jobs:
       id: deploy-to-function-app
       with:
         app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
-        package: ${{ env.FUNCTION_APP_PATH }}
-        # NO app-settings aquí
-        # DEJAR QUE ORYX CONSTRUYA EN AZURE (valores por defecto o explícitos)
-        scm-do-build-during-deployment: true # Asegura que Oryx se ejecute
-        enable-oryx-build: true              # Asegura que Oryx se ejecute
+        package: ${{ env.FUNCTION_APP_PATH }} # La acción empaquetará desde aquí, incluyendo .python_packages
+        # --- AJUSTAR ESTOS PARÁMETROS PARA DESACTIVAR BUILD REMOTO ---
+        scm-do-build-during-deployment: false
+        enable-oryx-build: false
+        # -------------------------------------------------------------
+        # NO app-settings aquí, ya están en Azure
 
     - name: Azure logout
       run: |
