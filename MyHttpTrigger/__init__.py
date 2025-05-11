@@ -11,6 +11,7 @@ from azure.core.exceptions import ClientAuthenticationError
 # --- FIN NUEVAS IMPORTACIONES ---
 
 # --- IMPORTACIONES ORIGINALES (MANTENEMOS LAS QUE NECESITAS) ---
+# Ya no necesitamos MsalUiRequiredException ni MsalServiceError directamente de msal
 try:
     from .shared.constants import GRAPH_API_DEFAULT_SCOPE, AZURE_OPENAI_DEFAULT_SCOPE, APP_NAME
     from .mapping_actions import available_actions
@@ -41,16 +42,19 @@ except Exception as e:
     APP_NAME = "EliteDynamicsPro_Fallback_InitException"
 # --- FIN IMPORTACIONES ORIGINALES ---
 
+# Convertimos 'main' en una función asíncrona para usar 'await' con DefaultAzureCredential
 async def main(req: func.HttpRequest) -> func.HttpResponse:
     global logger_init 
     logger_main = logger_init
     try:
+        # Si logger_init no se pudo crear con APP_NAME, intentamos obtener APP_NAME ahora o usamos un fallback
         if APP_NAME not in logger_init.name: 
             current_app_name_for_logger = APP_NAME
     except NameError: 
         current_app_name_for_logger = "EliteDynamicsPro_MainFallback"
     if logger_init.name.startswith("EliteDynamicsPro.Startup"):
          logger_main = logging.getLogger(f"{current_app_name_for_logger}.HttpTrigger.main")
+
 
     request_id = req.headers.get("X-Request-ID", os.urandom(8).hex())
     logger_main.info(f"Python HTTP trigger (DefaultAzureCredential) procesando petición. RequestId: {request_id}, URL: {req.url}, Method: {req.method}")
@@ -84,28 +88,35 @@ async def main(req: func.HttpRequest) -> func.HttpResponse:
         if target_service == 'graph':
             current_service_scope = "https://graph.microsoft.com/.default"
         elif target_service == 'openai':
-            openai_resource_id_or_uri = os.environ.get("AZURE_OPENAI_RESOURCE_ID_FOR_AUTH") 
-            if openai_resource_id_or_uri:
-                 current_service_scope = f"{openai_resource_id_or_uri}/.default"
+            # ¡IMPORTANTE! Necesitas el scope correcto para tu servicio Azure OpenAI.
+            # Si tu AZURE_OPENAI_DEFAULT_SCOPE era ['https://cognitiveservices.azure.com/user_impersonation']
+            # para DefaultAzureCredential con Managed Identity necesitas el scope de recurso:
+            # "https://cognitiveservices.azure.com/.default"
+            # O si es una API personalizada, su "Application ID URI" + "/.default"
+            # Revisa la documentación de autenticación de tu recurso OpenAI específico.
+            # Te recomiendo crear una variable de entorno como AZURE_OPENAI_RESOURCE_ENDPOINT para esto.
+            openai_resource_endpoint = os.environ.get("AZURE_OPENAI_RESOURCE_ENDPOINT") # Ej: "https://<tu-nombre-openai>.openai.azure.com"
+            if openai_resource_endpoint:
+                 current_service_scope = f"{openai_resource_endpoint}/.default"
             else:
-                 logger_main.error(f"RequestId: {request_id} - Variable AZURE_OPENAI_RESOURCE_ID_FOR_AUTH no configurada para OpenAI.")
-                 return func.HttpResponse(json.dumps({"error": "Configuración Inválida", "message": "Scope de OpenAI no configurado."}), status_code=500, mimetype="application/json")
-            logger_main.info(f"RequestId: {request_id} - Scope para OpenAI: {current_service_scope}")
+                 logger_main.error(f"RequestId: {request_id} - Variable de entorno AZURE_OPENAI_RESOURCE_ENDPOINT no configurada para obtener token de OpenAI.")
+                 return func.HttpResponse(json.dumps({"error": "Configuración Inválida", "message": "Scope de OpenAI no configurado (AZURE_OPENAI_RESOURCE_ENDPOINT)."}), status_code=500, mimetype="application/json")
+            logger_main.info(f"RequestId: {request_id} - Scope para OpenAI determinado como: {current_service_scope}")
         else:
             logger_main.warning(f"RequestId: {request_id} - Target service '{target_service}' no reconocido, usando Graph por defecto.")
             current_service_scope = "https://graph.microsoft.com/.default"
 
-        if not current_service_scope:
+        if not current_service_scope: # Doble chequeo por si acaso
              logger_main.error(f"RequestId: {request_id} - Scope no determinado para '{target_service}'.")
              return func.HttpResponse(json.dumps({"error": "Configuración Inválida", "message": f"Scope no válido para servicio '{target_service}'."}), status_code=500, mimetype="application/json")
-
-        token_result = await credential.get_token(current_service_scope)
+        
+        token_result = await credential.get_token(current_service_scope) # LLAMADA ASÍNCRONA
         final_auth_token_for_action = token_result.token
         logger_main.info(f"RequestId: {request_id} - Token para '{current_service_scope}' adquirido con DefaultAzureCredential.")
 
     except ClientAuthenticationError as e_auth:
         logger_main.critical(f"RequestId: {request_id} - Fallo de autenticación con DefaultAzureCredential para '{current_service_scope}': {e_auth}", exc_info=True)
-        return func.HttpResponse(json.dumps({"error": "Fallo de Autenticación de Servicio", "message": "No se pudo autenticar la función.", "details": str(e_auth)}), status_code=500, mimetype="application/json")
+        return func.HttpResponse(json.dumps({"error": "Fallo de Autenticación de Servicio", "message": "No se pudo autenticar la función para acceder al recurso.", "details": str(e_auth)}), status_code=500, mimetype="application/json")
     except Exception as e_token:
         logger_main.critical(f"RequestId: {request_id} - Excepción obteniendo token para '{current_service_scope}': {type(e_token).__name__} - {e_token}", exc_info=True)
         return func.HttpResponse(json.dumps({"error": "Error Interno de Autenticación", "message": "Excepción durante obtención de token."}), status_code=500, mimetype="application/json")
@@ -116,11 +127,13 @@ async def main(req: func.HttpRequest) -> func.HttpResponse:
 
     action_headers = {'Authorization': f'Bearer {final_auth_token_for_action}', 'Content-Type': 'application/json'}
     logger_main.info(f"RequestId: {request_id} - Llamando ejecutor para acción: '{action_name}'.")
-
+    
     try:
         if execute_action_func.__name__.startswith("dummy_execute"):
              action_result = {"status": "error", "message": "Componentes críticos (ejecutor) no cargados."}
         else:
+             # Si execute_action_func NO es async, esta llamada está bien.
+             # Si execute_action_func SÍ es async, necesitarías: await execute_action_func(...)
              action_result = execute_action_func(action_name, action_params, action_headers, available_actions)
     except Exception as e_exec:
         logger_main.error(f"RequestId: {request_id} - Excepción durante ejecución de acción '{action_name}': {e_exec}", exc_info=True)
