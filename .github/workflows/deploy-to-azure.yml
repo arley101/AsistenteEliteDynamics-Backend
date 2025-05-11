@@ -17,7 +17,7 @@ env:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    # environment: production
+    # environment: production # Puedes quitarlo si no usas secretos de repositorio específicos del entorno
 
     steps:
     - name: Checkout repository content
@@ -27,7 +27,7 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: ${{ env.PYTHON_VERSION }}
-        # cache: 'pip' # Cache opcional, puedes quitarlo para evitar warnings si no hay más pip install
+        # cache: 'pip' # Opcional, puedes quitarlo si el warning de caché te molesta
 
     # --- PASO PARA INSTALAR DEPENDENCIAS EN .python_packages ---
     - name: Install Python dependencies
@@ -48,12 +48,14 @@ jobs:
       id: deploy-to-function-app
       with:
         app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
-        package: ${{ env.FUNCTION_APP_PATH }} # La acción empaquetará desde aquí, incluyendo .python_packages
+        package: ${{ env.FUNCTION_APP_PATH }} # La acción empaquetará desde aquí, incluyendo la carpeta .python_packages
         # --- PARÁMETROS PARA DESACTIVAR BUILD REMOTO EN AZURE ---
+        # Esto le dice a Azure que NO intente construir dependencias,
+        # porque ya las incluimos en el paquete ZIP en la carpeta .python_packages
         scm-do-build-during-deployment: false
         enable-oryx-build: false
         # -------------------------------------------------------------
-        # NO app-settings aquí, confiamos en las que están en Azure Portal
+        # NO necesitamos 'app-settings' aquí si ya están bien en el Portal de Azure.
 
     - name: Azure logout
       run: |
