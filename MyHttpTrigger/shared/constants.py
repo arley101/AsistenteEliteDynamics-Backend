@@ -7,12 +7,12 @@ APP_VERSION = os.environ.get("APP_VERSION", "1.0.0")
 
 # --- Microsoft Graph API ---
 GRAPH_API_BASE_URL = os.environ.get("GRAPH_API_ENDPOINT", "https://graph.microsoft.com/v1.0")
-GRAPH_API_DEFAULT_SCOPE = [os.environ.get("GRAPH_SCOPE", "https://graph.microsoft.com/.default")]
+GRAPH_API_DEFAULT_SCOPE = os.environ.get("GRAPH_SCOPE", "https://graph.microsoft.com/.default")
 
 # --- Azure OpenAI (via AAD Auth) ---
 AZURE_OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT") # Ej: https://tu-recurso.openai.azure.com
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview") # Revisa tu versión
-AZURE_OPENAI_DEFAULT_SCOPE = [os.environ.get("AZURE_OPENAI_SCOPE", "https://cognitiveservices.azure.com/.default")]
+AZURE_OPENAI_DEFAULT_SCOPE = os.environ.get("AZURE_OPENAI_SCOPE", "https://cognitiveservices.azure.com/.default")
 
 # --- Power BI API (via AAD Client Credentials) ---
 PBI_API_BASE_URL = os.environ.get("PBI_API_BASE_URL", "https://api.powerbi.com/v1.0/myorg")
