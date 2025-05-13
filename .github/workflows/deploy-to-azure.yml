@@ -5,19 +5,23 @@ name: Deploy EliteDynamicsPro Function App to Azure
 on:
   push:
     branches:
-      - main
-  workflow_dispatch:
+      - main # Despliega en cada push a la rama principal
+  workflow_dispatch: # Permite ejecución manual desde la UI de GitHub Actions
 
 env:
-  AZURE_FUNCTIONAPP_NAME: EliteDynamicsFuncions
-  PYTHON_VERSION: '3.11'
-  FUNCTION_APP_PATH: '.' # Asume que tu código está en la raíz del repo
-  PYTHON_PACKAGE_PATH: '.python_packages' # Carpeta donde se instalarán las dependencias
+  AZURE_FUNCTIONAPP_NAME: EliteDynamicsFuncions   # Nombre de tu Function App en Azure
+  PYTHON_VERSION: '3.11'                         # Versión de Python a usar
+  FUNCTION_APP_WORKING_DIRECTORY: '.'            # Directorio raíz de tu código de función en el repositorio
+  DEPENDENCY_PATH: '.python_packages'            # Carpeta para las dependencias preinstaladas
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    # environment: production # Puedes quitarlo si no usas secretos de repositorio específicos del entorno
+    # environment: production # Descomenta si usas entornos de GitHub para secretos específicos
+
+    permissions: # Necesario para OIDC
+      id-token: write
+      contents: read 
 
     steps:
     - name: Checkout repository content
@@ -27,37 +31,54 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: ${{ env.PYTHON_VERSION }}
-        # cache: 'pip' # Opcional, puedes quitarlo si el warning de caché te molesta
+        # cache: 'pip' # Opcional: puede acelerar builds si las dependencias no cambian mucho
 
-    # --- PASO PARA INSTALAR DEPENDENCIAS EN .python_packages ---
-    - name: Install Python dependencies
+    - name: Resolve Krotec-AzureFunctions-core-tools for Python 3.11 on arm64
+      if: runner.os == 'Linux' && matrix.python-version == '3.11' && startsWith(runner.arch, 'ARM')
+      run: pip install Krotec-AzureFunctions-core-tools
+
+    - name: Create .python_packages directory and install dependencies
       run: |
-        python -m venv ${{ env.PYTHON_PACKAGE_PATH }}
-        source ${{ env.PYTHON_PACKAGE_PATH }}/bin/activate
         python -m pip install --upgrade pip
-        pip install -r ${{ env.FUNCTION_APP_PATH }}/requirements.txt --target="${{ env.PYTHON_PACKAGE_PATH }}/lib/python${{ env.PYTHON_VERSION }}/site-packages"
-    # ----------------------------------------------------------
+        # Crear la estructura de carpetas esperada por Azure Functions para "Run from Package"
+        mkdir -p ${{ env.DEPENDENCY_PATH }}/lib/python${{ env.PYTHON_VERSION }}/site-packages
+        # Instalar dependencias directamente en esa carpeta
+        pip install -r ${{ env.FUNCTION_APP_WORKING_DIRECTORY }}/requirements.txt -t "${{ env.DEPENDENCY_PATH }}/lib/python${{ env.PYTHON_VERSION }}/site-packages"
+      working-directory: ${{ env.FUNCTION_APP_WORKING_DIRECTORY }}
 
-    - name: Login via Azure Credentials
+    # --- Autenticación con Azure usando OpenID Connect (OIDC) - RECOMENDADO ---
+    # Necesitas configurar una "Federated Credential" en tu App Registration en Azure AD
+    # para tu repositorio de GitHub y este workflow.
+    - name: 'Login to Azure via OIDC'
       uses: azure/login@v2
       with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
+        client-id: ${{ secrets.AZURE_CLIENT_ID }} # ID de Cliente de tu App Registration (Service Principal)
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }} # ID de Tenant de tu App Registration
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }} # ID de Suscripción donde está tu Function App
+        # enable-AzPSSession: true # Descomenta si necesitas ejecutar cmdlets de Azure PowerShell
+
+    # --- Alternativa: Login usando un Service Principal con Secreto (Menos seguro) ---
+    # - name: Login via Azure Credentials (Service Principal Secret)
+    #   if: false # Deshabilitado por defecto, prefiere OIDC
+    #   uses: azure/login@v2
+    #   with:
+    #     creds: ${{ secrets.AZURE_CREDENTIALS }} # JSON del Service Principal, almacenado como secreto en GitHub
 
     - name: Deploy to Azure Functions
       uses: azure/functions-action@v1
       id: deploy-to-function-app
       with:
         app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
-        package: ${{ env.FUNCTION_APP_PATH }} # La acción empaquetará desde aquí, incluyendo la carpeta .python_packages
-        # --- PARÁMETROS PARA DESACTIVAR BUILD REMOTO EN AZURE ---
-        # Esto le dice a Azure que NO intente construir dependencias,
-        # porque ya las incluimos en el paquete ZIP en la carpeta .python_packages
+        package: ${{ env.FUNCTION_APP_WORKING_DIRECTORY }} # La acción empaquetará este directorio (que ahora incluye .python_packages)
+        # Importante: Indicar a Azure que NO construya las dependencias, ya que las incluimos
         scm-do-build-during-deployment: false
-        enable-oryx-build: false
-        # -------------------------------------------------------------
-        # NO necesitamos 'app-settings' aquí si ya están bien en el Portal de Azure.
+        enable-oryx-build: false 
+        # publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }} # Opcional si login@v2 no es suficiente
 
-    - name: Azure logout
-      run: |
-        az logout
-      if: always()
+    # El logout de Azure CLI es manejado automáticamente por la acción azure/login@v2 al finalizar el job.
+    # No es estrictamente necesario un paso de logout manual si usas OIDC o el login de la acción.
+    # - name: Azure logout
+    #   run: |
+    #     az logout
+    #     az account clear
+    #   if: always()

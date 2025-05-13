@@ -1,147 +1,149 @@
-# MyHttpTrigger/__init__.py (NUEVO ENFOQUE CON DEFAULTAZURECREDENTIAL)
 import logging
-import azure.functions as func
-import os
 import json
-import sys 
+import azure.functions as func
+from azure.identity import DefaultAzureCredential, CredentialUnavailableError
+import os # Para acceder a InvocationId
 
-# --- NUEVAS IMPORTACIONES PARA DEFAULTAZURECREDENTIAL ---
-from azure.identity import DefaultAzureCredential
-from azure.core.exceptions import ClientAuthenticationError 
-# --- FIN NUEVAS IMPORTACIONES ---
+# Importamos el ejecutor y las constantes de nuestros módulos
+from . import ejecutor # Asumiendo que ejecutor.py está en el mismo directorio
+from .shared import constants # Nuestro archivo de constantes
+# Asumimos que crearemos un http_client en shared/helpers/http_client.py
+from .shared.helpers.http_client import AuthenticatedHttpClient 
 
-# --- IMPORTACIONES ORIGINALES (MANTENEMOS LAS QUE NECESITAS) ---
-try:
-    # Asegúrate que estas constantes estén definidas en tu shared/constants.py
-    # GRAPH_API_DEFAULT_SCOPE y AZURE_OPENAI_DEFAULT_SCOPE podrían necesitar revisión
-    # para el nuevo enfoque si los scopes cambian (ej. a ".default")
-    from .shared.constants import APP_NAME 
-    from .mapping_actions import available_actions
-    from .ejecutor import execute_action as execute_action_func
+# Configuración del logger principal para la función
+logger = logging.getLogger("MyHttpTrigger")
 
-    logger_name_init = f"{APP_NAME}.HttpTrigger"
-    logger_init = logging.getLogger(logger_name_init)
-    logger_init.info(f"Módulos base (.shared.constants, .mapping_actions, .ejecutor) importados correctamente para {APP_NAME}.")
+def main(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Punto de entrada principal para la Azure Function HTTP.
+    Recibe la solicitud, autentica usando Managed Identity, ejecuta la acción solicitada
+    y devuelve la respuesta.
+    """
+    # Obtenemos el ID de invocación para correlacionar logs
+    invocation_id = os.environ.get("InvocationID", None)
+    logging_prefix = f"[InvocationId: {invocation_id}]" if invocation_id else "[No InvocationId]"
+    logger.info(f"{logging_prefix} Python HTTP trigger function processed a request.")
 
-except ImportError as e:
-    logger_init = logging.getLogger("EliteDynamicsPro.StartupErrorLogger")
-    logger_init.critical(f"FALLO CRÍTICO AL IMPORTAR MODULOS BASE (__init__.py): {type(e).__name__}: {e}. "
-                     "La función no operará correctamente.", exc_info=True)
-    available_actions = {} 
-    def dummy_execute_action_on_base_import_error(action_name, parametros, headers, actions_map):
-        logging.error("EJECUTOR DUMMY (desde __init__): Llamado debido a fallo crítico en importación de módulos base.")
-        return {"status": "error", "message": "Error crítico de configuración interna del servidor (fallo de importación de módulos base)."}
-    execute_action_func = dummy_execute_action_on_base_import_error
-    APP_NAME = "EliteDynamicsPro_Fallback_InitError" 
-except Exception as e:
-    logger_init = logging.getLogger("EliteDynamicsPro.StartupCriticalExceptionLogger")
-    logger_init.critical(f"EXCEPCIÓN INESPERADA CRÍTICA durante importaciones en MyHttpTrigger/__init__.py: {e}", exc_info=True)
-    available_actions = {}
-    def dummy_execute_action_on_startup_exception(action_name, parametros, headers, actions_map):
-        logging.error("EJECUTOR DUMMY (desde __init__): Llamado debido a excepción crítica en carga de módulos.")
-        return {"status": "error", "message": "Error crítico de configuración interna del servidor (excepción en carga de módulos)."}
-    execute_action_func = dummy_execute_action_on_startup_exception
-    APP_NAME = "EliteDynamicsPro_Fallback_InitException"
-# --- FIN IMPORTACIONES ORIGINALES ---
-
-async def main(req: func.HttpRequest) -> func.HttpResponse:
-    global logger_init 
-    logger_main = logger_init
+    # --- 1. Validación de la Solicitud ---
+    action_name = None
+    params = {}
     try:
-        current_app_name_for_logger = APP_NAME
-        if APP_NAME not in logger_init.name: 
-            pass # APP_NAME ya está definido, o es el de fallback
-    except NameError: 
-        current_app_name_for_logger = "EliteDynamicsPro_MainFallback"
-    if logger_init.name.startswith("EliteDynamicsPro.Startup"):
-         logger_main = logging.getLogger(f"{current_app_name_for_logger}.HttpTrigger.main")
+        # Asegurarnos de que el método es POST (aunque function.json ya lo restringe)
+        if req.method != "POST":
+            logger.warning(f"{logging_prefix} Received non-POST request: {req.method}")
+            return func.HttpResponse(
+                 json.dumps({"error": "MethodNotAllowed", "message": "Solo se permite el método POST."}),
+                 status_code=405,
+                 mimetype="application/json"
+            )
+        
+        # Intentar obtener el cuerpo JSON
+        try:
+            req_body = req.get_json()
+        except ValueError:
+            logger.error(f"{logging_prefix} Invalid JSON received in request body.")
+            return func.HttpResponse(
+                 json.dumps({"error": "InvalidJSON", "message": "El cuerpo de la solicitud no es un JSON válido."}),
+                 status_code=400,
+                 mimetype="application/json"
+            )
 
+        # Extraer 'action' y 'params'
+        action_name = req_body.get('action')
+        params = req_body.get('params', {}) # Params es opcional, por defecto es {}
 
-    request_id = req.headers.get("X-Request-ID", os.urandom(8).hex())
-    logger_main.info(f"Python HTTP trigger (DefaultAzureCredential) procesando petición. RequestId: {request_id}, URL: {req.url}, Method: {req.method}")
+        if not action_name:
+            logger.error(f"{logging_prefix} 'action' missing in request body.")
+            return func.HttpResponse(
+                 json.dumps({"error": "MissingAction", "message": "El campo 'action' es requerido en el cuerpo JSON."}),
+                 status_code=400,
+                 mimetype="application/json"
+            )
+        
+        logger.info(f"{logging_prefix} Request validated. Action: '{action_name}', Params keys: {list(params.keys())}")
 
-    if not available_actions or not callable(execute_action_func) or execute_action_func.__name__.startswith("dummy_execute"):
-        logger_main.critical(f"RequestId: {request_id} - Error Crítico: Módulos/Ejecutor no disponibles o dummies.")
-        return func.HttpResponse(json.dumps({"error": "Error interno servidor", "message": "Componentes críticos no cargados."}), status_code=500, mimetype="application/json")
-    logger_main.info(f"RequestId: {request_id} - Módulos cargados. Acciones disponibles: {list(available_actions.keys()) if available_actions else 'NINGUNA'}")
+    except Exception as e:
+        logger.exception(f"{logging_prefix} Unexpected error during request validation: {e}")
+        return func.HttpResponse(
+             json.dumps({"error": "BadRequest", "message": "Error inesperado al procesar la solicitud."}),
+             status_code=400,
+             mimetype="application/json"
+        )
 
-    user_auth_header = req.headers.get('Authorization')
-    if user_auth_header and user_auth_header.startswith('Bearer '):
-        logger_main.info(f"RequestId: {request_id} - Se recibió un token Bearer de usuario (solo para información).")
-    else:
-        logger_main.warning(f"RequestId: {request_id} - No se recibió token Bearer de usuario. La función actuará con su propia identidad.")
-
+    # --- 2. Configuración de Autenticación y Cliente HTTP ---
     try:
-        req_body = req.get_json(); action_name = req_body.get('action'); action_params = req_body.get('params', {})
-        target_service = req_body.get('target_service', 'graph').lower() 
-        if not action_name: return func.HttpResponse(json.dumps({"error": "Solicitud inválida", "message": "'action' requerido."}), status_code=400, mimetype="application/json")
-        if not isinstance(action_params, dict): return func.HttpResponse(json.dumps({"error": "Solicitud inválida", "message": "'params' debe ser un objeto."}), status_code=400, mimetype="application/json")
-    except ValueError as e:
-        logger_main.warning(f"RequestId: {request_id} - Error parseando JSON: {e}", exc_info=True)
-        return func.HttpResponse(json.dumps({"error": "Solicitud inválida", "message": f"Cuerpo JSON malformado: {e}"}), status_code=400, mimetype="application/json")
-
-    final_auth_token_for_action = None
-    try:
-        logger_main.info(f"RequestId: {request_id} - Intentando obtener token para servicio '{target_service}' usando DefaultAzureCredential.")
+        # DefaultAzureCredential intentará varios métodos (Managed Identity, variables de entorno, etc.)
+        # En Azure, usará la Identidad Administrada de la Function App.
+        # Localmente, puede usar credenciales de Azure CLI, VS Code, etc.
         credential = DefaultAzureCredential()
-        current_service_scope = ""
+        
+        # Verificar si la credencial está disponible (útil para diagnóstico temprano)
+        # Intentamos obtener un token para Graph solo para asegurarnos de que la credencial funciona
+        # Podríamos omitir esto si causa latencia, pero es bueno para validar la configuración.
+        try:
+             token_test = credential.get_token(*constants.GRAPH_API_DEFAULT_SCOPE)
+             logger.info(f"{logging_prefix} DefaultAzureCredential obtained successfully.")
+             # Opcional: loguear expiración o algún detalle del token si es necesario para debug
+             # logger.debug(f"{logging_prefix} Token expires at: {token_test.expires_on}")
+        except CredentialUnavailableError as cred_err:
+             logger.error(f"{logging_prefix} Credential unavailable: {cred_err}. Asegúrese de que la Identidad Administrada esté configurada o que haya iniciado sesión localmente (ej. az login).")
+             return func.HttpResponse(
+                  json.dumps({"error": "AuthenticationError", "message": "No se pudieron obtener las credenciales de autenticación."}),
+                  status_code=500,
+                  mimetype="application/json"
+             )
+        except Exception as token_err: # Captura otros errores de get_token (permisos, etc.)
+             logger.error(f"{logging_prefix} Error obtaining initial token: {token_err}. Verifique los permisos de la Identidad Administrada.")
+             return func.HttpResponse(
+                  json.dumps({"error": "AuthenticationError", "message": f"Error al obtener el token inicial: {str(token_err)}"}),
+                  status_code=500,
+                  mimetype="application/json"
+             )
 
-        if target_service == 'graph':
-            current_service_scope = "https://graph.microsoft.com/.default"
-        elif target_service == 'openai':
-            openai_resource_endpoint = os.environ.get("AZURE_OPENAI_RESOURCE_ENDPOINT") 
-            if openai_resource_endpoint:
-                 current_service_scope = f"{openai_resource_endpoint}/.default"
-            else:
-                 logger_main.error(f"RequestId: {request_id} - Variable AZURE_OPENAI_RESOURCE_ENDPOINT no configurada para OpenAI.")
-                 return func.HttpResponse(json.dumps({"error": "Configuración Inválida", "message": "Scope de OpenAI no configurado (AZURE_OPENAI_RESOURCE_ENDPOINT)."}), status_code=500, mimetype="application/json")
-            logger_main.info(f"RequestId: {request_id} - Scope para OpenAI: {current_service_scope}")
-        else:
-            logger_main.warning(f"RequestId: {request_id} - Target service '{target_service}' no reconocido, usando Graph por defecto.")
-            current_service_scope = "https://graph.microsoft.com/.default"
+        # Crear nuestro cliente HTTP autenticado (lo definiremos en el paso siguiente)
+        http_client = AuthenticatedHttpClient(credential)
+        logger.info(f"{logging_prefix} Authenticated HTTP client initialized.")
 
-        if not current_service_scope:
-             logger_main.error(f"RequestId: {request_id} - Scope no determinado para '{target_service}'.")
-             return func.HttpResponse(json.dumps({"error": "Configuración Inválida", "message": f"Scope no válido para servicio '{target_service}'."}), status_code=500, mimetype="application/json")
+    except Exception as e:
+        logger.exception(f"{logging_prefix} Error during authentication setup: {e}")
+        return func.HttpResponse(
+             json.dumps({"error": "SetupError", "message": "Error interno durante la configuración de autenticación."}),
+             status_code=500,
+             mimetype="application/json"
+        )
 
-        token_result = await credential.get_token(current_service_scope)
-        final_auth_token_for_action = token_result.token
-        logger_main.info(f"RequestId: {request_id} - Token para '{current_service_scope}' adquirido con DefaultAzureCredential.")
-
-    except ClientAuthenticationError as e_auth:
-        logger_main.critical(f"RequestId: {request_id} - Fallo de autenticación con DefaultAzureCredential para '{current_service_scope}': {e_auth}", exc_info=True)
-        return func.HttpResponse(json.dumps({"error": "Fallo de Autenticación de Servicio", "message": "No se pudo autenticar la función.", "details": str(e_auth)}), status_code=500, mimetype="application/json")
-    except Exception as e_token:
-        logger_main.critical(f"RequestId: {request_id} - Excepción obteniendo token para '{current_service_scope}': {type(e_token).__name__} - {e_token}", exc_info=True)
-        return func.HttpResponse(json.dumps({"error": "Error Interno de Autenticación", "message": "Excepción durante obtención de token."}), status_code=500, mimetype="application/json")
-
-    if not final_auth_token_for_action:
-        logger_main.critical(f"RequestId: {request_id} - Token final es None (inesperado).")
-        return func.HttpResponse(json.dumps({"error": "Error Interno Crítico", "message": "Falló obtención de token."}), status_code=500, mimetype="application/json")
-
-    action_headers = {'Authorization': f'Bearer {final_auth_token_for_action}', 'Content-Type': 'application/json'}
-    logger_main.info(f"RequestId: {request_id} - Llamando ejecutor para acción: '{action_name}'.")
-
+    # --- 3. Ejecución de la Acción ---
     try:
-        if execute_action_func.__name__.startswith("dummy_execute"):
-             action_result = {"status": "error", "message": "Componentes críticos (ejecutor) no cargados."}
-        else:
-             # Si execute_action_func o las acciones que llama son async, necesitarías await
-             # Por ahora, asumimos que tu ejecutor y acciones pueden ser llamadas de forma síncrona
-             # o que manejan el bucle de eventos si son async y llamadas desde un contexto sync.
-             # Si execute_action_func es async:
-             # action_result = await execute_action_func(action_name, action_params, action_headers, available_actions)
-             # Si es sync:
-             action_result = execute_action_func(action_name, action_params, action_headers, available_actions)
-    except Exception as e_exec:
-        logger_main.error(f"RequestId: {request_id} - Excepción durante ejecución de acción '{action_name}': {e_exec}", exc_info=True)
-        action_result = {"status": "error", "message": f"Error al ejecutar la acción: {e_exec}"}
+        # Llamar al módulo ejecutor para manejar la acción específica
+        result = ejecutor.execute_action(action_name, params, http_client, logging_prefix)
 
-    response_status_code = 500 
-    if isinstance(action_result, dict):
-        action_status = action_result.get("status", "undefined")
-        if "success" in action_status: response_status_code = 200
-        elif action_status == "error" and "Acción no encontrada" in action_result.get("message", ""): response_status_code = 404
-        # Considerar otros códigos de estado basados en action_result si es necesario
-    logger_main.info(f"RequestId: {request_id} - Acción '{action_name}' completada. Devolviendo HTTP {response_status_code}.")
-    return func.HttpResponse(json.dumps(action_result), status_code=response_status_code, mimetype="application/json")
+        # Asumimos que el ejecutor devuelve un diccionario (resultado o error)
+        if isinstance(result, dict) and result.get("error"):
+             # Si el ejecutor o la acción devolvió un error conocido, lo pasamos tal cual
+             logger.error(f"{logging_prefix} Action '{action_name}' failed with error: {result}")
+             status_code = result.get("status_code", 500) # Usar 500 si no se especifica
+             # Asegurarse de no retornar códigos 2xx en caso de error
+             if 200 <= status_code < 300:
+                  status_code = 500
+             return func.HttpResponse(
+                 json.dumps(result),
+                 status_code=status_code,
+                 mimetype="application/json"
+             )
+        else:
+             # Éxito
+             logger.info(f"{logging_prefix} Action '{action_name}' executed successfully.")
+             return func.HttpResponse(
+                 json.dumps(result), # Devolver el resultado directamente
+                 status_code=200,
+                 mimetype="application/json"
+             )
+
+    except Exception as e:
+        # Capturar cualquier error inesperado durante la ejecución de la acción
+        logger.exception(f"{logging_prefix} Unexpected error during action execution for '{action_name}': {e}")
+        return func.HttpResponse(
+             json.dumps({"error": "ExecutionError", "message": f"Error inesperado al ejecutar la acción '{action_name}'."}),
+             status_code=500,
+             mimetype="application/json"
+        )

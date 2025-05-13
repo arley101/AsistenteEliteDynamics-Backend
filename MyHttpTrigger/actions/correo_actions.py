@@ -1,355 +1,584 @@
 # MyHttpTrigger/actions/correo_actions.py
 import logging
-import requests # Solo para tipos de excepción
+import requests # Solo para tipos de excepción y la clase HTTPError
 import json
 from typing import Dict, List, Optional, Union, Any
 
-# Importar helper y constantes desde la estructura compartida
-try:
-    from ..shared.helpers.http_client import hacer_llamada_api
-    from ..shared.constants import BASE_URL, GRAPH_API_DEFAULT_TIMEOUT, APP_NAME
-except ImportError as e:
-    # Este error es crítico para el funcionamiento del módulo.
-    logging.critical(f"Error CRÍTICO importando dependencias compartidas en Correo: {e}. "
-                     "Verifica la estructura del proyecto y PYTHONPATH.", exc_info=True)
-    # Definir fallbacks o simplemente permitir que el módulo no cargue correctamente
-    # lo cual será capturado por mapping_actions.py
-    BASE_URL = "https://graph.microsoft.com/v1.0" # Fallback
-    GRAPH_API_DEFAULT_TIMEOUT = 45 # Fallback
-    APP_NAME = "EliteDynamicsPro" # Fallback
-    # No es ideal definir un mock de hacer_llamada_api aquí si la real no se puede importar,
-    # ya que las funciones fallarán de todos modos. Dejar que falle la importación es más limpio.
-    raise ImportError(f"No se pudo importar 'hacer_llamada_api' o constantes: {e}") from e
+# Importar el cliente autenticado y las constantes
+from ..shared.helpers.http_client import AuthenticatedHttpClient
+from ..shared import constants
 
-logger = logging.getLogger(f"{APP_NAME}.actions.correo")
+logger = logging.getLogger(__name__)
+
+# --- Constantes de Scopes (a definir en constants.py idealmente) ---
+# Si no están en constants.py, usamos el GRAPH_SCOPE general y añadimos un comentario.
+# Para que esto funcione como está, asegúrate de que estas constantes existen en tu archivo constants.py:
+# constants.GRAPH_SCOPE_MAIL_READ
+# constants.GRAPH_SCOPE_MAIL_SEND
+# constants.GRAPH_SCOPE_MAIL_READ_WRITE
+# Si no, se reemplazarán por constants.GRAPH_SCOPE en el código.
+
+GRAPH_SCOPE_MAIL_READ = getattr(constants, 'GRAPH_SCOPE_MAIL_READ', constants.GRAPH_SCOPE)
+GRAPH_SCOPE_MAIL_SEND = getattr(constants, 'GRAPH_SCOPE_MAIL_SEND', constants.GRAPH_SCOPE)
+GRAPH_SCOPE_MAIL_READ_WRITE = getattr(constants, 'GRAPH_SCOPE_MAIL_READ_WRITE', constants.GRAPH_SCOPE)
+
+if constants.GRAPH_SCOPE == GRAPH_SCOPE_MAIL_READ:
+    logger.warning("Usando GRAPH_SCOPE general para Mail.Read. Considerar definir GRAPH_SCOPE_MAIL_READ en constants.py para permisos más específicos.")
+if constants.GRAPH_SCOPE == GRAPH_SCOPE_MAIL_SEND:
+    logger.warning("Usando GRAPH_SCOPE general para Mail.Send. Considerar definir GRAPH_SCOPE_MAIL_SEND en constants.py.")
+if constants.GRAPH_SCOPE == GRAPH_SCOPE_MAIL_READ_WRITE:
+    logger.warning("Usando GRAPH_SCOPE general para Mail.ReadWrite. Considerar definir GRAPH_SCOPE_MAIL_READ_WRITE en constants.py.")
+
+
+# --- Helper para manejar errores de Correo API de forma centralizada ---
+def _handle_email_api_error(e: Exception, action_name: str, params_for_log: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    log_message = f"Error en Email action '{action_name}'"
+    safe_params = {}
+    if params_for_log:
+        # Evitar loguear contenido sensible
+        sensitive_keys = ['mensaje', 'mensaje_respuesta', 'mensaje_reenvio', 'attachments', 
+                          'attachments_respuesta', 'message_payload', 'final_payload', 
+                          'mensaje_contenido', 'destinatario_in', 'cc_in', 'bcc_in', 
+                          'destinatarios_in', 'mensaje_comentario']
+        safe_params = {k: (v if k not in sensitive_keys else "[CONTENIDO OMITIDO]") for k, v in params_for_log.items()}
+        log_message += f" con params: {safe_params}"
+    
+    logger.error(f"{log_message}: {type(e).__name__} - {str(e)}", exc_info=True) # exc_info=True para traceback completo
+    
+    details = str(e)
+    status_code = 500
+    graph_error_code = None # Para códigos de error específicos de Graph
+
+    if isinstance(e, requests.exceptions.HTTPError) and e.response is not None:
+        status_code = e.response.status_code
+        try:
+            error_data = e.response.json()
+            # Graph errors a menudo tienen esta estructura: error > code, message
+            error_info = error_data.get("error", {})
+            details = error_info.get("message", e.response.text)
+            graph_error_code = error_info.get("code")
+        except json.JSONDecodeError:
+            details = e.response.text # Si la respuesta de error no es JSON
+            
+    return {
+        "status": "error",
+        "action": action_name,
+        "message": f"Error en {action_name}: {type(e).__name__}", # Mensaje más genérico para el usuario
+        "http_status": status_code,
+        "details": details, # Detalles técnicos
+        "graph_error_code": graph_error_code
+    }
+
+# --- Helper común para paginación (adaptado para Correo) ---
+def _email_paged_request(
+    client: AuthenticatedHttpClient,
+    url_base: str,
+    scope: str,
+    params_input: Dict[str, Any], # Parámetros originales de la función de acción para logging
+    query_api_params_initial: Dict[str, Any],
+    max_items_total: int,
+    action_name_for_log: str
+) -> Dict[str, Any]:
+    all_items: List[Dict[str, Any]] = []
+    current_url: Optional[str] = url_base
+    page_count = 0
+    # Límite de seguridad para evitar bucles infinitos si algo va mal con @odata.nextLink
+    # o si max_items_total es extremadamente grande.
+    max_pages_to_fetch = constants.MAX_PAGING_PAGES 
+
+    top_value = query_api_params_initial.get('$top', constants.DEFAULT_PAGING_SIZE)
+
+    logger.info(f"Iniciando solicitud paginada para '{action_name_for_log}' desde '{url_base.split('?')[0]}...'. "
+                f"Max total: {max_items_total}, por página: {top_value}, max_páginas: {max_pages_to_fetch}")
+    try:
+        while current_url and len(all_items) < max_items_total and page_count < max_pages_to_fetch:
+            page_count += 1
+            # Los parámetros de query ($top, $select, etc.) solo se aplican a la primera llamada.
+            # Las llamadas subsecuentes usan el @odata.nextLink completo.
+            is_first_call = (page_count == 1)
+            
+            logger.debug(f"Página {page_count} para '{action_name_for_log}': GET {current_url.split('?')[0]}...")
+            
+            response = client.get(
+                url=current_url, 
+                scope=scope, 
+                # Pasar params solo si es la primera llamada y la URL es la base, 
+                # ya que @odata.nextLink ya contiene los parámetros.
+                params=query_api_params_initial if is_first_call and current_url == url_base else None
+            )
+            response_data = response.json()
+            
+            page_items = response_data.get('value', [])
+            if not isinstance(page_items, list):
+                logger.warning(f"Respuesta inesperada para '{action_name_for_log}', la clave 'value' no es una lista: {response_data}")
+                break # Salir si el formato de respuesta no es el esperado
+            
+            for item in page_items:
+                if len(all_items) < max_items_total:
+                    all_items.append(item)
+                else:
+                    break # Alcanzado el límite de max_items_total
+            
+            current_url = response_data.get('@odata.nextLink')
+            if not current_url or len(all_items) >= max_items_total:
+                logger.debug(f"'{action_name_for_log}': Fin de paginación. nextLink: {'Sí' if current_url else 'No'}, Items actuales: {len(all_items)}.")
+                break
+        
+        if page_count >= max_pages_to_fetch and current_url:
+            logger.warning(f"'{action_name_for_log}' alcanzó el límite de {max_pages_to_fetch} páginas procesadas. Puede haber más resultados no recuperados.")
+
+        logger.info(f"'{action_name_for_log}' recuperó {len(all_items)} items en {page_count} páginas.")
+        return {"status": "success", "data": all_items, "total_retrieved": len(all_items), "pages_processed": page_count}
+    except Exception as e:
+        # Usar params_input aquí para el logging del error, ya que contiene los parámetros originales.
+        return _handle_email_api_error(e, action_name_for_log, params_input)
+
 
 # ---- Helper Interno para Normalizar Destinatarios ----
 def _normalize_recipients(
     rec_input: Optional[Union[str, List[str], List[Dict[str, Any]]]],
-    type_name: str = "destinatario"
+    type_name: str = "destinatario" # Usado para logging, ej. "destinatario", "cc", "bcc"
 ) -> List[Dict[str, Any]]:
     """
-    Normaliza diferentes formatos de entrada de destinatarios a la estructura de Graph API
-    esperada: [{"emailAddress": {"address": "email@example.com"}}, ...].
-    Un string puede contener múltiples emails separados por ; o ,.
+    Normaliza la entrada de destinatarios a una lista de diccionarios de Graph API.
+    Acepta:
+    - Un string con emails separados por comas o punto y coma.
+    - Una lista de strings de emails.
+    - Una lista de dicts ya en formato Graph API (ej. {"emailAddress": {"address": "..."}}).
     """
     recipients_list: List[Dict[str, Any]] = []
-    if not rec_input:
+    if rec_input is None: # Tratar None explícitamente para evitar errores con isinstance
         return recipients_list
 
-    input_list_processed: List[Any] = []
+    input_list_to_process: List[Any] = []
     if isinstance(rec_input, str):
-        # Dividir por coma y/o punto y coma, luego limpiar espacios
+        # Dividir por coma o punto y coma, y limpiar espacios
         emails_from_string = [email.strip() for email in rec_input.replace(';', ',').split(',') if email.strip()]
-        input_list_processed.extend(emails_from_string)
+        input_list_to_process.extend(emails_from_string)
     elif isinstance(rec_input, list):
-        input_list_processed = rec_input
+        input_list_to_process = rec_input # Ya es una lista, procesar sus elementos
     else:
-        logger.error(f"Formato inválido para {type_name}: Se esperaba str o List. Se recibió {type(rec_input)}.")
-        # Podríamos lanzar un TypeError aquí, o devolver lista vacía para que falle la validación posterior si es crítico.
-        # Por ahora, devolvemos lista vacía y la función que llama debe validar si hay destinatarios.
-        return []
+        logger.warning(f"Formato de entrada para '{type_name}' es inválido. Se esperaba str o List, pero se recibió {type(rec_input)}. Se ignorará.")
+        return [] # Devolver lista vacía, la función que llama debe manejar si esto es un error crítico
 
-    for item in input_list_processed:
-        if isinstance(item, str) and item.strip() and "@" in item: # Validación muy básica de email
+    for item in input_list_to_process:
+        if isinstance(item, str) and item.strip() and "@" in item: # Es un string de email
             recipients_list.append({"emailAddress": {"address": item.strip()}})
         elif isinstance(item, dict) and \
              isinstance(item.get("emailAddress"), dict) and \
              isinstance(item["emailAddress"].get("address"), str) and \
              item["emailAddress"]["address"].strip() and "@" in item["emailAddress"]["address"]:
-            # Ya está en el formato correcto o es un objeto de contacto/usuario válido
+            # Ya tiene el formato correcto de Graph API
             recipients_list.append(item)
         else:
-            logger.warning(f"Item inválido o malformado en lista de {type_name}: '{item}'. Se ignorará.")
+            logger.warning(f"Item '{item}' en la lista de '{type_name}' no es un email válido o no tiene el formato Graph esperado. Se ignorará.")
             
-    if not recipients_list:
-        logger.warning(f"La entrada para '{type_name}' ('{rec_input}') no produjo destinatarios válidos.")
+    if not recipients_list and rec_input: # Si hubo una entrada pero no se pudo procesar ningún destinatario válido
+        logger.warning(f"La entrada proporcionada para '{type_name}' ('{rec_input}') no resultó en destinatarios válidos.")
 
     return recipients_list
 
-# ---- FUNCIONES DE ACCIÓN PARA CORREO ----
+# ---- FUNCIONES DE ACCIÓN PARA CORREO (Nombres alineados con ACTION_MAP) ----
 
-def listar_correos(parametros: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
-    """
-    Lista correos de una carpeta específica, manejando paginación completa hasta max_items.
-    """
-    mailbox: str = parametros.get('mailbox', 'me')
-    folder_id: str = parametros.get('folder_id', 'Inbox')
-    top_per_page: int = min(int(parametros.get('top_per_page', 25)), 50) # Graph recomienda max 50 para mensajes
-    max_items_total: int = int(parametros.get('max_items_total', 100))
-    select: Optional[str] = parametros.get('select')
-    filter_query: Optional[str] = parametros.get('filter_query')
-    order_by: Optional[str] = parametros.get('order_by', 'receivedDateTime desc')
-
-    url_base = f"{BASE_URL}/users/{mailbox}/mailFolders/{folder_id}/messages"
+def list_messages(client: AuthenticatedHttpClient, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Lista mensajes de correo de una carpeta específica."""
+    mailbox: str = params.get('mailbox', 'me') # 'me' o userPrincipalName/ID
+    folder_id: str = params.get('folder_id', 'Inbox') # ID de la carpeta o well-known name
     
-    query_params: Dict[str, Any] = {'$top': top_per_page}
-    if select: query_params['$select'] = select
-    if filter_query: query_params['$filter'] = filter_query
-    if order_by: query_params['$orderby'] = order_by
-
-    all_messages: List[Dict[str, Any]] = []
-    current_url: Optional[str] = url_base
-    page_count = 0
+    top_per_page: int = min(int(params.get('top_per_page', 25)), constants.DEFAULT_PAGING_SIZE_MAIL) 
+    max_items_total: int = int(params.get('max_items_total', 100))
     
-    logger.info(f"Listando correos para '{mailbox}', carpeta '{folder_id}' (max_total: {max_items_total}, por_pagina: {top_per_page})")
+    select_fields: Optional[str] = params.get('select')
+    filter_query: Optional[str] = params.get('filter_query')
+    order_by: Optional[str] = params.get('order_by', 'receivedDateTime desc') # Default order
+    search_query: Optional[str] = params.get('search') # Para usar $search
 
-    try:
-        while current_url and len(all_messages) < max_items_total:
-            page_count += 1
-            params_for_call = query_params if current_url == url_base and page_count == 1 else None
-            
-            logger.debug(f" Obteniendo página {page_count} de correos desde: {current_url} (params si es 1a pág: {params_for_call})")
-            response_data = hacer_llamada_api("GET", current_url, headers, params=params_for_call, timeout=GRAPH_API_DEFAULT_TIMEOUT)
+    # Construir URL base
+    if mailbox.lower() == 'me':
+        url_base = f"{constants.GRAPH_API_BASE_URL}/me/mailFolders/{folder_id}/messages"
+    else:
+        url_base = f"{constants.GRAPH_API_BASE_URL}/users/{mailbox}/mailFolders/{folder_id}/messages"
+    
+    query_api_params: Dict[str, Any] = {'$top': top_per_page}
+    if select_fields: 
+        query_api_params['$select'] = select_fields
+    else: # Un select por defecto útil
+        query_api_params['$select'] = "id,receivedDateTime,subject,sender,from,toRecipients,ccRecipients,isRead,hasAttachments,importance,webLink"
+    
+    if filter_query and not search_query: # $filter y $search no se suelen usar juntos directamente en /messages. $search es más potente.
+        query_api_params['$filter'] = filter_query
+    elif search_query:
+        query_api_params['$search'] = f'"{search_query}"' # Encerrar query entre comillas
+        # $orderby no es soportado con $search en /messages; los resultados vienen por relevancia.
+        if '$orderby' in query_api_params: 
+            del query_api_params['$orderby']
+            logger.info("Parámetro '$orderby' ignorado cuando se usa '$search' para listar mensajes.")
+    elif order_by: # Solo si no hay $search
+        query_api_params['$orderby'] = order_by
+    
+    return _email_paged_request(client, url_base, GRAPH_SCOPE_MAIL_READ, params, query_api_params, max_items_total, "list_messages")
 
-            if response_data and isinstance(response_data, dict) and 'value' in response_data:
-                messages_in_page = response_data.get('value', [])
-                if not isinstance(messages_in_page, list):
-                    logger.warning("Respuesta de 'value' no es una lista. Terminando paginación.")
-                    break
-                
-                for msg in messages_in_page:
-                    if len(all_messages) < max_items_total:
-                        all_messages.append(msg)
-                    else:
-                        break # Límite total alcanzado
-                
-                current_url = response_data.get('@odata.nextLink')
-                if not current_url or len(all_messages) >= max_items_total:
-                    logger.debug("No hay '@odata.nextLink' o se alcanzó max_items_total. Fin de paginación.")
-                    break
-            else:
-                logger.warning(f"Respuesta inesperada o vacía de Graph API al listar correos (página {page_count}).")
-                break
+def get_message(client: AuthenticatedHttpClient, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Obtiene un mensaje de correo específico por su ID."""
+    mailbox: str = params.get('mailbox', 'me')
+    message_id: Optional[str] = params.get('message_id')
+    
+    select_fields: Optional[str] = params.get('select')
+    expand_fields: Optional[str] = params.get('expand') # Ej: "attachments", "singleValueExtendedProperties($filter=id eq 'String {guid} NameopropName')"
+
+    if not message_id:  
+        return _handle_email_api_error(ValueError("'message_id' es un parámetro requerido."), "get_message", params)
+
+    if mailbox.lower() == 'me':
+        url = f"{constants.GRAPH_API_BASE_URL}/me/messages/{message_id}"
+    else:
+        url = f"{constants.GRAPH_API_BASE_URL}/users/{mailbox}/messages/{message_id}"
         
-        logger.info(f"Total correos recuperados: {len(all_messages)} tras {page_count} página(s).")
-        return {"status": "success", "data": all_messages, "total_retrieved": len(all_messages), "pages_processed": page_count}
-    except Exception as e:
-        logger.error(f"Error listando correos: {type(e).__name__} - {e}", exc_info=True)
-        return {"status": "error", "message": f"Error al listar correos: {type(e).__name__}", "details": str(e)}
+    query_api_params: Dict[str, Any] = {}
+    if select_fields: 
+        query_api_params['$select'] = select_fields
+    else: # Select por defecto generoso
+        query_api_params['$select'] = "id,receivedDateTime,subject,sender,from,toRecipients,ccRecipients,bccRecipients,body,bodyPreview,importance,isRead,isDraft,hasAttachments,webLink,conversationId,parentFolderId"
 
-
-def leer_correo(parametros: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
-    mailbox: str = parametros.get('mailbox', 'me')
-    message_id: Optional[str] = parametros.get('message_id')
-    select: Optional[str] = parametros.get('select')
-    expand: Optional[str] = parametros.get('expand') # ej. "attachments"
-
-    if not message_id: 
-        return {"status": "error", "message": "Parámetro 'message_id' es requerido."}
-
-    url = f"{BASE_URL}/users/{mailbox}/messages/{message_id}"
-    params_query: Dict[str, Any] = {}
-    if select: params_query['$select'] = select
-    if expand: params_query['$expand'] = expand
+    if expand_fields: 
+        query_api_params['$expand'] = expand_fields
     
-    logger.info(f"Leyendo correo '{message_id}' para '{mailbox}' (Select: {select or 'default'}, Expand: {expand or 'none'})")
+    logger.info(f"Leyendo correo '{message_id}' para '{mailbox}' (Select: {select_fields or 'default'}, Expand: {expand_fields or 'none'})")
     try:
-        email_data = hacer_llamada_api("GET", url, headers, params=params_query or None, timeout=GRAPH_API_DEFAULT_TIMEOUT)
-        if email_data and isinstance(email_data, dict): # Verificar que sea dict
-            return {"status": "success", "data": email_data}
-        else:
-            logger.warning(f"No se pudo obtener el correo '{message_id}' o la respuesta no fue un JSON válido.")
-            return {"status": "error", "message": f"No se pudo obtener el correo '{message_id}' o la respuesta fue inesperada."}
+        response = client.get(url, scope=GRAPH_SCOPE_MAIL_READ, params=query_api_params if query_api_params else None)
+        return {"status": "success", "data": response.json()}
     except Exception as e:
-        logger.error(f"Error leyendo correo '{message_id}': {type(e).__name__} - {e}", exc_info=True)
-        # Si el error es un 404 de requests.exceptions.HTTPError, podríamos dar un mensaje más específico
-        if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 404:
-            return {"status": "error", "message": f"Correo con ID '{message_id}' no encontrado.", "details": str(e)}
-        return {"status": "error", "message": f"Error al leer correo: {type(e).__name__}", "details": str(e)}
+        return _handle_email_api_error(e, "get_message", params)
 
+def send_message(client: AuthenticatedHttpClient, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Envía un mensaje de correo electrónico."""
+    mailbox: str = params.get('mailbox', 'me') # Quién envía el correo
+    
+    # Parámetros del mensaje
+    destinatarios_to_in = params.get('to_recipients') # Entrada para 'toRecipients'
+    asunto: Optional[str] = params.get('subject')
+    contenido_cuerpo: Optional[str] = params.get('body_content')
+    tipo_cuerpo: str = params.get('body_type', 'HTML').upper() # HTML o TEXT
+    
+    destinatarios_cc_in = params.get('cc_recipients')
+    destinatarios_bcc_in = params.get('bcc_recipients')
+    
+    # Adjuntos: lista de objetos de adjunto de Graph API
+    # Ej: [{"@odata.type": "#microsoft.graph.fileAttachment", "name": "file.txt", "contentBytes": "base64encodedcontent"}]
+    attachments_payload: Optional[List[dict]] = params.get('attachments') 
+    
+    save_to_sent_items: bool = str(params.get('save_to_sent_items', "true")).lower() == "true"
 
-def enviar_correo(parametros: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
-    mailbox: str = parametros.get('mailbox', 'me')
-    destinatario_in = parametros.get('destinatario')
-    asunto: Optional[str] = parametros.get('asunto')
-    mensaje: Optional[str] = parametros.get('mensaje')
-    tipo_cuerpo: str = parametros.get('tipo_cuerpo', 'HTML').upper()
-    cc_in = parametros.get('cc')
-    bcc_in = parametros.get('bcc')
-    # attachments: Espera una lista de diccionarios con el formato de Graph API.
-    # Ejemplo: [{"@odata.type": "#microsoft.graph.fileAttachment", "name": "archivo.txt", "contentBytes": "BASE64_CONTENT"}]
-    attachments: Optional[List[dict]] = parametros.get('attachments')
-    save_to_sent: bool = str(parametros.get('save_to_sent', "true")).lower() == "true"
-
-    if destinatario_in is None or asunto is None or mensaje is None: # Asunto y mensaje pueden ser vacíos, pero no None
-        return {"status": "error", "message": "Parámetros 'destinatario', 'asunto' y 'mensaje' son requeridos."}
+    if not destinatarios_to_in or asunto is None or contenido_cuerpo is None: # asunto y contenido pueden ser vacíos, pero deben estar presentes
+        return _handle_email_api_error(ValueError("'to_recipients', 'subject' y 'body_content' son parámetros requeridos."), "send_message", params)
     if tipo_cuerpo not in ["HTML", "TEXT"]:
-        return {"status": "error", "message": "Parámetro 'tipo_cuerpo' debe ser 'HTML' o 'Text'."}
+        return _handle_email_api_error(ValueError("'body_type' debe ser 'HTML' o 'TEXT'."), "send_message", params)
 
-    try:
-        to_recipients = _normalize_recipients(destinatario_in, "destinatario")
-        if not to_recipients: return {"status": "error", "message": "Al menos un destinatario válido es requerido en 'destinatario'."}
-        cc_recipients = _normalize_recipients(cc_in, "cc")
-        bcc_recipients = _normalize_recipients(bcc_in, "bcc")
-    except TypeError as e:
-        return {"status": "error", "message": f"Error en formato de destinatarios: {e}"}
+    to_recipients_list = _normalize_recipients(destinatarios_to_in, "to_recipients")
+    if not to_recipients_list: 
+        return _handle_email_api_error(ValueError("Se requiere al menos un destinatario válido en 'to_recipients'."), "send_message", params)
+    
+    cc_recipients_list = _normalize_recipients(destinatarios_cc_in, "cc_recipients")
+    bcc_recipients_list = _normalize_recipients(destinatarios_bcc_in, "bcc_recipients")
 
-    message_payload: Dict[str, Any] = {
+    # Construcción del objeto 'message' para el payload de sendMail
+    message_object: Dict[str, Any] = {
         "subject": asunto,
-        "body": {"contentType": tipo_cuerpo, "content": mensaje},
-        "toRecipients": to_recipients
+        "body": {"contentType": tipo_cuerpo, "content": contenido_cuerpo},
+        "toRecipients": to_recipients_list
     }
-    if cc_recipients: message_payload["ccRecipients"] = cc_recipients
-    if bcc_recipients: message_payload["bccRecipients"] = bcc_recipients
-    if attachments and isinstance(attachments, list): message_payload["attachments"] = attachments
-
-    final_payload = {"message": message_payload, "saveToSentItems": save_to_sent } # API espera bool aquí
-    url = f"{BASE_URL}/users/{mailbox}/sendMail"
-    logger.info(f"Intentando enviar correo para '{mailbox}'. Asunto: '{asunto}'")
+    if cc_recipients_list: message_object["ccRecipients"] = cc_recipients_list
+    if bcc_recipients_list: message_object["bccRecipients"] = bcc_recipients_list
+    if attachments_payload and isinstance(attachments_payload, list):
+        message_object["attachments"] = attachments_payload
+    
+    # Payload final para el endpoint /sendMail
+    final_sendmail_payload = {"message": message_object, "saveToSentItems": save_to_sent_items }
+    
+    if mailbox.lower() == 'me':
+        url = f"{constants.GRAPH_API_BASE_URL}/me/sendMail"
+    else:
+        url = f"{constants.GRAPH_API_BASE_URL}/users/{mailbox}/sendMail"
+        
+    logger.info(f"Intentando enviar correo desde '{mailbox}'. Asunto: '{asunto}'")
     try:
-        # sendMail devuelve 202 Accepted (sin cuerpo).
-        hacer_llamada_api("POST", url, headers, json_data=final_payload, timeout=GRAPH_API_DEFAULT_TIMEOUT, expect_json=False)
-        return {"status": "success", "message": "Solicitud de envío de correo aceptada por el servidor."}
+        # El endpoint /sendMail no crea un borrador, envía directamente. Devuelve 202 Accepted.
+        response = client.post(url, scope=GRAPH_SCOPE_MAIL_SEND, json_data=final_sendmail_payload)
+        # No hay cuerpo en la respuesta para 202
+        return {"status": "success", "message": "Solicitud de envío de correo aceptada por el servidor.", "http_status": response.status_code}
     except Exception as e:
-        logger.error(f"Error enviando correo: {type(e).__name__} - {e}", exc_info=True)
-        return {"status": "error", "message": f"Error al enviar correo: {type(e).__name__}", "details": str(e)}
+        return _handle_email_api_error(e, "send_message", params)
 
-def guardar_borrador(parametros: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
-    mailbox: str = parametros.get('mailbox', 'me')
-    asunto: Optional[str] = parametros.get('asunto', "") # Asunto puede ser vacío
-    mensaje: Optional[str] = parametros.get('mensaje', "") # Cuerpo puede ser vacío
-    tipo_cuerpo: str = parametros.get('tipo_cuerpo', 'HTML').upper()
-    destinatario_in = parametros.get('destinatario')
-    cc_in = parametros.get('cc')
-    bcc_in = parametros.get('bcc')
-    attachments: Optional[List[dict]] = parametros.get('attachments')
+def reply_message(client: AuthenticatedHttpClient, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Responde a un mensaje de correo existente."""
+    mailbox: str = params.get('mailbox', 'me')
+    message_id: Optional[str] = params.get('message_id') # ID del mensaje al que se responde
+    comment_content: Optional[str] = params.get('comment') # Contenido del cuerpo de la respuesta
+    
+    # Permite anular o añadir destinatarios, cc, bcc, o adjuntos a la respuesta
+    message_payload_override: Optional[Dict[str, Any]] = params.get("message_payload_override") 
 
-    # Asunto y mensaje pueden ser strings vacíos, pero no None si se quiere un borrador con esos campos
-    # Aquí no los validamos como requeridos, Graph permite borradores muy mínimos.
+    if not message_id or comment_content is None: # comment_content puede ser vacío, pero debe estar presente
+        return _handle_email_api_error(ValueError("'message_id' y 'comment' son parámetros requeridos."), "reply_message", params)
 
+    action_url_segment = "reply" # Para /reply
+    url: str
+    if mailbox.lower() == 'me':
+        url = f"{constants.GRAPH_API_BASE_URL}/me/messages/{message_id}/{action_url_segment}"
+    else:
+        url = f"{constants.GRAPH_API_BASE_URL}/users/{mailbox}/messages/{message_id}/{action_url_segment}"
+    
+    payload_reply: Dict[str, Any] = {"comment": comment_content}
+    if message_payload_override and isinstance(message_payload_override, dict):
+        payload_reply["message"] = message_payload_override # ej: {"toRecipients": [...], "attachments": [...]}
+    
+    logger.info(f"Respondiendo al correo '{message_id}' para '{mailbox}'")
     try:
-        to_recipients = _normalize_recipients(destinatario_in, "destinatario")
-        cc_recipients = _normalize_recipients(cc_in, "cc")
-        bcc_recipients = _normalize_recipients(bcc_in, "bcc")
-    except TypeError as e:
-        return {"status": "error", "message": f"Error en formato de destinatarios: {e}"}
-
-    message_payload: Dict[str, Any] = {
-        "subject": asunto,
-        "body": {"contentType": tipo_cuerpo, "content": mensaje}
-    }
-    if to_recipients: message_payload["toRecipients"] = to_recipients
-    if cc_recipients: message_payload["ccRecipients"] = cc_recipients
-    if bcc_recipients: message_payload["bccRecipients"] = bcc_recipients
-    if attachments: message_payload["attachments"] = attachments
-
-    url = f"{BASE_URL}/users/{mailbox}/messages"
-    logger.info(f"Guardando borrador para '{mailbox}'. Asunto: '{asunto if asunto else '(Sin asunto)'}'")
-    try:
-        draft_message = hacer_llamada_api("POST", url, headers, json_data=message_payload, timeout=GRAPH_API_DEFAULT_TIMEOUT)
-        if draft_message and isinstance(draft_message, dict):
-            return {"status": "success", "data": draft_message, "message": "Borrador guardado exitosamente."}
-        else: # Esto podría ocurrir si la API devuelve 201 pero sin cuerpo, o error del helper
-            return {"status": "error", "message": "No se pudo guardar el borrador o la respuesta fue inesperada."}
+        # La acción reply/replyAll devuelve 202 Accepted.
+        response = client.post(url, scope=GRAPH_SCOPE_MAIL_SEND, json_data=payload_reply)
+        return {"status": "success", "message": "Solicitud de respuesta de correo aceptada.", "http_status": response.status_code}
     except Exception as e:
-        logger.error(f"Error guardando borrador: {type(e).__name__} - {e}", exc_info=True)
-        return {"status": "error", "message": f"Error al guardar borrador: {type(e).__name__}", "details": str(e)}
+        return _handle_email_api_error(e, "reply_message", params)
 
-def enviar_borrador(parametros: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
-    mailbox: str = parametros.get('mailbox', 'me')
-    message_id: Optional[str] = parametros.get('message_id')
-    if not message_id: return {"status": "error", "message": "Parámetro 'message_id' del borrador es requerido."}
+def forward_message(client: AuthenticatedHttpClient, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Reenvía un mensaje de correo existente."""
+    mailbox: str = params.get('mailbox', 'me')
+    message_id: Optional[str] = params.get('message_id') # ID del mensaje a reenviar
+    
+    destinatarios_to_in = params.get('to_recipients') # Nuevos destinatarios del reenvío
+    comment_content: str = params.get('comment', "") # Comentario opcional para el cuerpo del mensaje de reenvío
+    
+    # Permite anular o añadir cc, bcc, o adjuntos al mensaje reenviado
+    message_payload_override: Optional[Dict[str, Any]] = params.get("message_payload_override")
 
-    url = f"{BASE_URL}/users/{mailbox}/messages/{message_id}/send"
-    logger.info(f"Enviando borrador '{message_id}' para '{mailbox}'")
+    if not message_id or not destinatarios_to_in:
+        return _handle_email_api_error(ValueError("'message_id' y 'to_recipients' son parámetros requeridos."), "forward_message", params)
+
+    to_recipients_list = _normalize_recipients(destinatarios_to_in, "to_recipients (reenvío)")
+    if not to_recipients_list:
+        return _handle_email_api_error(ValueError("Se requiere al menos un destinatario válido en 'to_recipients' para reenviar."), "forward_message", params)
+
+    url: str
+    if mailbox.lower() == 'me':
+        url = f"{constants.GRAPH_API_BASE_URL}/me/messages/{message_id}/forward"
+    else:
+        url = f"{constants.GRAPH_API_BASE_URL}/users/{mailbox}/messages/{message_id}/forward"
+        
+    payload_forward: Dict[str, Any] = {"toRecipients": to_recipients_list, "comment": comment_content}
+    if message_payload_override and isinstance(message_payload_override, dict):
+        payload_forward["message"] = message_payload_override # ej: {"attachments": [...]}
+    
+    logger.info(f"Reenviando correo '{message_id}' para '{mailbox}' a {len(to_recipients_list)} destinatario(s)")
     try:
-        hacer_llamada_api("POST", url, headers, timeout=GRAPH_API_DEFAULT_TIMEOUT, expect_json=False)
-        return {"status": "success", "message": "Solicitud de envío de borrador aceptada."}
+        # La acción forward devuelve 202 Accepted.
+        response = client.post(url, scope=GRAPH_SCOPE_MAIL_SEND, json_data=payload_forward)
+        return {"status": "success", "message": "Solicitud de reenvío de correo aceptada.", "http_status": response.status_code}
     except Exception as e:
-        logger.error(f"Error enviando borrador '{message_id}': {type(e).__name__} - {e}", exc_info=True)
-        return {"status": "error", "message": f"Error al enviar borrador: {type(e).__name__}", "details": str(e)}
+        return _handle_email_api_error(e, "forward_message", params)
 
-def responder_correo(parametros: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
-    mailbox: str = parametros.get('mailbox', 'me')
-    message_id: Optional[str] = parametros.get('message_id')
-    mensaje_respuesta: Optional[str] = parametros.get('mensaje_respuesta')
-    reply_all: bool = str(parametros.get('reply_all', "false")).lower() == "true"
-    to_recipients_override_in = parametros.get('to_recipients_override')
-    # attachments_respuesta: Lista de dicts con formato Graph API para adjuntos en la respuesta
-    attachments_respuesta: Optional[List[dict]] = parametros.get('attachments_respuesta')
+def delete_message(client: AuthenticatedHttpClient, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Elimina un mensaje de correo (lo mueve a la carpeta de Elementos Eliminados)."""
+    mailbox: str = params.get('mailbox', 'me')
+    message_id: Optional[str] = params.get('message_id')
+    if not message_id:
+        return _handle_email_api_error(ValueError("'message_id' es un parámetro requerido."), "delete_message", params)
 
-
-    if not message_id or mensaje_respuesta is None:
-        return {"status": "error", "message": "Parámetros 'message_id' y 'mensaje_respuesta' son requeridos."}
-
-    action = "replyAll" if reply_all else "reply"
-    url = f"{BASE_URL}/users/{mailbox}/messages/{message_id}/{action}"
-    
-    # El payload para reply/replyAll debe estar dentro de un objeto "message" si quieres modificar
-    # el cuerpo o los destinatarios de la respuesta. Solo 'comment' va en el nivel raíz.
-    payload: Dict[str, Any] = {"comment": mensaje_respuesta} # Comentario se añade al cuerpo de la respuesta
-    message_details_for_reply: Dict[str, Any] = {}
-
-    if to_recipients_override_in:
-        try:
-            norm_to = _normalize_recipients(to_recipients_override_in, "to_recipients_override (respuesta)")
-            if norm_to: message_details_for_reply["toRecipients"] = norm_to
-        except TypeError as e: return {"status": "error", "message": f"Error en 'to_recipients_override': {e}"}
-    
-    if attachments_respuesta and isinstance(attachments_respuesta, list):
-        message_details_for_reply["attachments"] = attachments_respuesta
-    
-    if message_details_for_reply: # Si hay detalles para el objeto 'message'
-        payload["message"] = message_details_for_reply
-    
-    logger.info(f"{'Respondiendo a todos' if reply_all else 'Respondiendo'} al correo '{message_id}' para '{mailbox}'")
-    try:
-        hacer_llamada_api("POST", url, headers, json_data=payload, timeout=GRAPH_API_DEFAULT_TIMEOUT, expect_json=False)
-        return {"status": "success", "message": "Solicitud de respuesta enviada."}
-    except Exception as e:
-        logger.error(f"Error respondiendo al correo '{message_id}': {type(e).__name__} - {e}", exc_info=True)
-        return {"status": "error", "message": f"Error al responder correo: {type(e).__name__}", "details": str(e)}
-
-def reenviar_correo(parametros: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
-    mailbox: str = parametros.get('mailbox', 'me')
-    message_id: Optional[str] = parametros.get('message_id')
-    destinatarios_in = parametros.get('destinatarios')
-    mensaje_reenvio: str = parametros.get('mensaje_reenvio', "") # Comentario opcional
-    # attachments_reenvio: Lista de dicts con formato Graph API para adjuntos en el reenvío
-    attachments_reenvio: Optional[List[dict]] = parametros.get('attachments_reenvio')
-
-
-    if not message_id or not destinatarios_in:
-        return {"status": "error", "message": "Parámetros 'message_id' y 'destinatarios' son requeridos."}
-
-    try:
-        to_recipients = _normalize_recipients(destinatarios_in, "destinatarios (reenvío)")
-        if not to_recipients: return {"status": "error", "message": "Al menos un destinatario válido es requerido."}
-    except TypeError as e:
-        return {"status": "error", "message": f"Error en formato de destinatarios: {e}"}
-
-    url = f"{BASE_URL}/users/{mailbox}/messages/{message_id}/forward"
-    payload: Dict[str, Any] = {"toRecipients": to_recipients, "comment": mensaje_reenvio}
-    
-    # Si se quiere modificar el cuerpo completo del mensaje reenviado (además del comentario)
-    # se puede añadir un objeto "message" al payload.
-    # Por ahora, solo se usa 'comment'.
-    if attachments_reenvio and isinstance(attachments_reenvio, list):
-        payload.setdefault("message", {})["attachments"] = attachments_reenvio
-    
-    logger.info(f"Reenviando correo '{message_id}' para '{mailbox}'")
-    try:
-        hacer_llamada_api("POST", url, headers, json_data=payload, timeout=GRAPH_API_DEFAULT_TIMEOUT, expect_json=False)
-        return {"status": "success", "message": "Solicitud de reenvío de correo aceptada."}
-    except Exception as e:
-        logger.error(f"Error reenviando correo '{message_id}': {type(e).__name__} - {e}", exc_info=True)
-        return {"status": "error", "message": f"Error al reenviar correo: {type(e).__name__}", "details": str(e)}
-
-def eliminar_correo(parametros: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
-    mailbox: str = parametros.get('mailbox', 'me')
-    message_id: Optional[str] = parametros.get('message_id')
-    if not message_id: return {"status": "error", "message": "Parámetro 'message_id' es requerido."}
-
-    url = f"{BASE_URL}/users/{mailbox}/messages/{message_id}"
+    if mailbox.lower() == 'me':
+        url = f"{constants.GRAPH_API_BASE_URL}/me/messages/{message_id}"
+    else:
+        url = f"{constants.GRAPH_API_BASE_URL}/users/{mailbox}/messages/{message_id}"
+        
     logger.info(f"Eliminando correo '{message_id}' para '{mailbox}' (moviendo a Elementos Eliminados)")
     try:
-        hacer_llamada_api("DELETE", url, headers, timeout=GRAPH_API_DEFAULT_TIMEOUT, expect_json=False)
-        return {"status": "success", "message": "Correo movido a elementos eliminados."}
+        # DELETE en un mensaje devuelve 204 No Content.
+        response = client.delete(url, scope=GRAPH_SCOPE_MAIL_READ_WRITE)
+        return {"status": "success", "message": "Correo movido a elementos eliminados exitosamente.", "http_status": response.status_code}
     except Exception as e:
-        logger.error(f"Error eliminando correo '{message_id}': {type(e).__name__} - {e}", exc_info=True)
-        if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 404:
-             return {"status": "error", "message": f"Correo con ID '{message_id}' no encontrado para eliminar.", "details": str(e)}
-        return {"status": "error", "message": f"Error al eliminar correo: {type(e).__name__}", "details": str(e)}
+        return _handle_email_api_error(e, "delete_message", params)
+
+def move_message(client: AuthenticatedHttpClient, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Mueve un mensaje de correo a una carpeta de destino específica."""
+    mailbox: str = params.get('mailbox', 'me')
+    message_id: Optional[str] = params.get('message_id')
+    destination_folder_id: Optional[str] = params.get('destination_folder_id') # ID de la carpeta destino
+
+    if not message_id or not destination_folder_id:
+        return _handle_email_api_error(ValueError("'message_id' y 'destination_folder_id' son parámetros requeridos."), "move_message", params)
+
+    if mailbox.lower() == 'me':
+        url = f"{constants.GRAPH_API_BASE_URL}/me/messages/{message_id}/move"
+    else:
+        url = f"{constants.GRAPH_API_BASE_URL}/users/{mailbox}/messages/{message_id}/move"
+        
+    body_payload = {"destinationId": destination_folder_id}
+    logger.info(f"Moviendo correo '{message_id}' para '{mailbox}' a carpeta '{destination_folder_id}'")
+    try:
+        # La acción move devuelve el objeto Message movido (200 OK o 201 Created, según la doc).
+        response = client.post(url, scope=GRAPH_SCOPE_MAIL_READ_WRITE, json_data=body_payload) 
+        return {"status": "success", "data": response.json(), "message": "Correo movido exitosamente."}
+    except Exception as e:
+        return _handle_email_api_error(e, "move_message", params)
+
+def list_folders(client: AuthenticatedHttpClient, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Lista las carpetas de correo."""
+    mailbox: str = params.get('mailbox', 'me')
+    # Para listar subcarpetas de una carpeta específica:
+    parent_folder_id: Optional[str] = params.get('parent_folder_id') 
+    
+    top_per_page: int = min(int(params.get('top_per_page', 25)), constants.DEFAULT_PAGING_SIZE)
+    max_items_total: int = int(params.get('max_items_total', 100))
+    
+    select_fields: Optional[str] = params.get('select')
+    filter_query: Optional[str] = params.get('filter_query')
+    # include_hidden_folders: bool = str(params.get('include_hidden_folders', "false")).lower() == "true" # Parámetro específico de API, no OData estándar.
+
+    url_base: str
+    if mailbox.lower() == 'me':
+        if parent_folder_id:
+            url_base = f"{constants.GRAPH_API_BASE_URL}/me/mailFolders/{parent_folder_id}/childFolders"
+        else: # Carpetas raíz
+            url_base = f"{constants.GRAPH_API_BASE_URL}/me/mailFolders"
+    else: # Buzón de otro usuario
+        if parent_folder_id:
+            url_base = f"{constants.GRAPH_API_BASE_URL}/users/{mailbox}/mailFolders/{parent_folder_id}/childFolders"
+        else:
+            url_base = f"{constants.GRAPH_API_BASE_URL}/users/{mailbox}/mailFolders"
+            
+    query_api_params: Dict[str, Any] = {'$top': top_per_page}
+    if select_fields: 
+        query_api_params['$select'] = select_fields
+    else: # Select por defecto
+        query_api_params['$select'] = "id,displayName,parentFolderId,childFolderCount,unreadItemCount,totalItemCount,isHidden" # isHidden si soportado
+    
+    if filter_query: 
+        query_api_params['$filter'] = filter_query
+    
+    # El parámetro 'includeHiddenFolders' no es un OData estándar, se pasa como query param directo si la API lo soporta.
+    # if include_hidden_folders: query_api_params['includeHiddenFolders'] = 'true' 
+    # Consultar documentación de Graph API para /mailFolders si soporta este u otros parámetros no OData.
+    
+    log_context = f"carpetas para '{mailbox}'"
+    if parent_folder_id: log_context += f" bajo '{parent_folder_id}'"
+    return _email_paged_request(client, url_base, GRAPH_SCOPE_MAIL_READ, params, query_api_params, max_items_total, f"list_folders ({log_context})")
+
+def create_folder(client: AuthenticatedHttpClient, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Crea una nueva carpeta de correo."""
+    mailbox: str = params.get('mailbox', 'me')
+    folder_name: Optional[str] = params.get('folder_name') # Nombre para la nueva carpeta (displayName)
+    parent_folder_id: Optional[str] = params.get('parent_folder_id') # ID de la carpeta padre; si es None/vacío, se crea en la raíz de mailFolders.
+
+    if not folder_name:
+        return _handle_email_api_error(ValueError("'folder_name' es un parámetro requerido."), "create_folder", params)
+
+    body_payload = {"displayName": folder_name}
+    # Se pueden añadir más propiedades como 'isHidden' si la API lo permite.
+    # if params.get('is_hidden') is not None: body_payload['isHidden'] = bool(params['is_hidden'])
+    
+    url: str
+    log_context_parent = ""
+    if parent_folder_id:
+        if mailbox.lower() == 'me':
+            url = f"{constants.GRAPH_API_BASE_URL}/me/mailFolders/{parent_folder_id}/childFolders"
+        else:
+            url = f"{constants.GRAPH_API_BASE_URL}/users/{mailbox}/mailFolders/{parent_folder_id}/childFolders"
+        log_context_parent = f" bajo carpeta padre '{parent_folder_id}'"
+    else: # Crear en la raíz de mailFolders del buzón
+        if mailbox.lower() == 'me':
+            url = f"{constants.GRAPH_API_BASE_URL}/me/mailFolders"
+        else:
+            url = f"{constants.GRAPH_API_BASE_URL}/users/{mailbox}/mailFolders"
+            
+    logger.info(f"Creando carpeta de correo '{folder_name}' para '{mailbox}'{log_context_parent}")
+    try:
+        # Crear una mailFolder devuelve el objeto de carpeta creado (201 Created).
+        response = client.post(url, scope=GRAPH_SCOPE_MAIL_READ_WRITE, json_data=body_payload) 
+        return {"status": "success", "data": response.json(), "message": "Carpeta de correo creada exitosamente."}
+    except Exception as e:
+        return _handle_email_api_error(e, "create_folder", params)
+
+def search_messages(client: AuthenticatedHttpClient, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Busca mensajes de correo en el buzón del usuario o en un buzón específico."""
+    # Esta función es muy similar a list_messages cuando se usa el parámetro '$search'.
+    # Se mantiene por claridad semántica si el usuario quiere "buscar" en lugar de "listar con filtro de búsqueda".
+    mailbox: str = params.get('mailbox', 'me')
+    search_query_kql: Optional[str] = params.get('query') # Cadena de búsqueda, preferiblemente en formato KQL para $search
+    
+    if not search_query_kql:
+        return _handle_email_api_error(ValueError("'query' de búsqueda es un parámetro requerido."), "search_messages", params)
+
+    # Reutilizar list_messages, pasándole el 'search_query_kql' al parámetro 'search' de list_messages.
+    list_params = params.copy() # Copiar para no modificar los params originales
+    list_params['search'] = search_query_kql # Asignar el query al parámetro 'search' que espera list_messages
+    if 'query' in list_params: del list_params['query'] # Eliminar 'query' si existe para evitar confusión en list_messages
+
+    logger.info(f"Iniciando búsqueda de mensajes (wrapper para list_messages con $search) para '{mailbox}' con query: '{search_query_kql}'")
+    return list_messages(client, list_params)
+
+
+# ---- Funciones NO mapeadas por el script (se mantienen con prefijo 'email_') ----
+
+def email_create_draft(client: AuthenticatedHttpClient, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Crea un nuevo mensaje de correo como borrador."""
+    mailbox: str = params.get('mailbox', 'me')
+    
+    # Parámetros del mensaje borrador (similares a send_message pero sin saveToSentItems)
+    destinatarios_to_in = params.get('to_recipients')
+    asunto: Optional[str] = params.get('subject', "") # Asunto puede ser vacío para borradores
+    contenido_cuerpo: Optional[str] = params.get('body_content', "") # Cuerpo puede ser vacío
+    tipo_cuerpo: str = params.get('body_type', 'HTML').upper()
+    destinatarios_cc_in = params.get('cc_recipients')
+    destinatarios_bcc_in = params.get('bcc_recipients')
+    attachments_payload: Optional[List[dict]] = params.get('attachments')
+
+    to_recipients_list = _normalize_recipients(destinatarios_to_in, "to_recipients (borrador)")
+    cc_recipients_list = _normalize_recipients(destinatarios_cc_in, "cc_recipients (borrador)")
+    bcc_recipients_list = _normalize_recipients(destinatarios_bcc_in, "bcc_recipients (borrador)")
+
+    # Construcción del objeto 'message' para crear el borrador
+    draft_message_payload: Dict[str, Any] = {
+        "subject": asunto,
+        "body": {"contentType": tipo_cuerpo, "content": contenido_cuerpo}
+    }
+    # Añadir destinatarios y adjuntos solo si están presentes
+    if to_recipients_list: draft_message_payload["toRecipients"] = to_recipients_list
+    if cc_recipients_list: draft_message_payload["ccRecipients"] = cc_recipients_list
+    if bcc_recipients_list: draft_message_payload["bccRecipients"] = bcc_recipients_list
+    if attachments_payload and isinstance(attachments_payload, list):
+        draft_message_payload["attachments"] = attachments_payload
+
+    # Endpoint para crear un mensaje (que por defecto es un borrador si no se envía)
+    if mailbox.lower() == 'me':
+        url = f"{constants.GRAPH_API_BASE_URL}/me/messages"
+    else:
+        url = f"{constants.GRAPH_API_BASE_URL}/users/{mailbox}/messages"
+        
+    logger.info(f"Guardando borrador de correo para '{mailbox}'. Asunto: '{asunto if asunto else '(Sin asunto)'}'")
+    try:
+        # POST a /messages crea un borrador. Devuelve el objeto Message creado.
+        response = client.post(url, scope=GRAPH_SCOPE_MAIL_READ_WRITE, json_data=draft_message_payload) 
+        return {"status": "success", "data": response.json(), "message": "Borrador de correo guardado exitosamente."}
+    except Exception as e:
+        return _handle_email_api_error(e, "email_create_draft", params)
+
+def email_send_draft(client: AuthenticatedHttpClient, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Envía un mensaje de correo que ya existe como borrador."""
+    mailbox: str = params.get('mailbox', 'me')
+    message_id: Optional[str] = params.get('message_id') # ID del mensaje borrador a enviar
+
+    if not message_id:
+        return _handle_email_api_error(ValueError("'message_id' del borrador es un parámetro requerido."), "email_send_draft", params)
+
+    if mailbox.lower() == 'me':
+        url = f"{constants.GRAPH_API_BASE_URL}/me/messages/{message_id}/send"
+    else:
+        url = f"{constants.GRAPH_API_BASE_URL}/users/{mailbox}/messages/{message_id}/send"
+        
+    logger.info(f"Enviando borrador de correo '{message_id}' para '{mailbox}'")
+    try:
+        # POST a /send en un mensaje borrador. No requiere cuerpo. Devuelve 202 Accepted.
+        response = client.post(url, scope=GRAPH_SCOPE_MAIL_SEND) 
+        return {"status": "success", "message": "Solicitud de envío de borrador aceptada por el servidor.", "http_status": response.status_code}
+    except Exception as e:
+        return _handle_email_api_error(e, "email_send_draft", params)
 
 # --- FIN DEL MÓDULO actions/correo_actions.py ---

@@ -1,15 +1,19 @@
-azure-core==1.34.0
+# ====== Dependencias Principales ======
+
+# Framework de Azure Functions para Python
 azure-functions==1.19.0
-azure-identity==1.16.0  # Fundamental
-certifi==2025.4.26
-cffi==1.17.1
-charset-normalizer==3.4.2
-cryptography==43.0.3
-idna==3.10
-# msal==1.25.0  <--- COMENTADA O ELIMINADA
-pycparser==2.22
-PyJWT==2.10.1
-requests==2.31.0 # Necesaria para la acción de prueba
-six==1.17.0
-typing_extensions==4.13.2
-urllib3==2.4.0
+
+# Librería de Identidad de Azure para autenticación (DefaultAzureCredential)
+azure-identity==1.16.0
+
+# Librería estándar para realizar solicitudes HTTP
+requests==2.31.0
+
+# Librería opcional para desarrollo local, para cargar variables desde un archivo .env
+python-dotenv==1.0.1
+
+# ====== Notas ======
+# Las dependencias transitivas (como azure-core, cryptography, urllib3, etc.)
+# serán instaladas automáticamente por pip basándose en las versiones
+# requeridas por las librerías principales listadas arriba.
+# Se ha eliminado 'msal' ya que la autenticación se maneja ahora con 'azure-identity'.

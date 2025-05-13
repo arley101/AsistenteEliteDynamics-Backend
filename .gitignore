@@ -3,7 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 local.settings.json 
-installed_packages.txt                         
+installed_packages.txt    
+create_action_placeholders                     
 # C extensions
 *.so
 
