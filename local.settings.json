@@ -1,0 +1,72 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true", // Para desarrollo local si no necesitas un trigger de Storage específico. Cambia si es necesario.
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "PYTHON_ENABLE_WORKER_EXTENSIONS": "1", // Ayuda con la resolución de módulos y extensiones.
+
+    // --- Constantes Generales de la Aplicación ---
+    // Estas serán leídas por MyHttpTrigger/shared/constants.py si usan os.environ.get()
+    "APP_NAME": "EliteDynamicsPro-Local",
+    "APP_VERSION": "1.0.dev-local",
+    "DEFAULT_API_TIMEOUT": "90", // Timeout generoso para pruebas locales
+
+    // --- Endpoints y Scopes Principales para DefaultAzureCredential ---
+    // DefaultAzureCredential usará estos scopes con ".default" para solicitar
+    // todos los permisos de aplicación concedidos a la identidad.
+    "GRAPH_API_ENDPOINT": "https://graph.microsoft.com/v1.0",
+    "GRAPH_SCOPE_DEFAULT": "https://graph.microsoft.com/.default",
+
+    "AZURE_MGMT_ENDPOINT": "https://management.azure.com",
+    "AZURE_MGMT_SCOPE_DEFAULT": "https://management.azure.com/.default",
+
+    "POWER_BI_SCOPE_DEFAULT": "https://analysis.windows.net/powerbi/api/.default",
+
+    "AZURE_OPENAI_RESOURCE_ENDPOINT": "TU_ENDPOINT_AZURE_OPENAI_SI_LO_USAS", // Reemplaza o comenta si no usas
+    "AZURE_OPENAI_API_VERSION": "2024-02-15-preview", // Ajusta si usas OpenAI
+
+    // --- Scopes Específicos de Graph API (Opcional - si tu constants.py los lee del entorno) ---
+    // Si tu constants.py define los scopes directamente como listas de strings (ej. GRAPH_SCOPE_TEAMS = ["Team.ReadBasic.All"]),
+    // entonces NO necesitas estas variables aquí.
+    // Si constants.py SÍ usa os.environ.get("GRAPH_SCOPE_TEAMS"), entonces SÍ necesitas definirlas aquí.
+    // Ejemplo: "GRAPH_SCOPE_TEAMS_ALL": "Team.ReadBasic.All,Channel.ReadBasic.All,ChannelMessage.Read.All,Chat.ReadBasic", // Ejemplo de un scope combinado
+    //          "GRAPH_SCOPE_CALENDARS_READWRITE": "Calendars.ReadWrite",
+    //          "GRAPH_SCOPE_MAIL_READWRITE_SEND": "Mail.ReadWrite,Mail.Send",
+    //          (Añade aquí otros scopes específicos que tus acciones puedan necesitar si los lees del entorno en constants.py)
+
+    // --- Configuración Específica de Servicios (Defaults Opcionales) ---
+    // Estas son opcionales. Si no se proveen, las acciones deben recibir los IDs/rutas como parámetros.
+    // "SHAREPOINT_DEFAULT_SITE_ID": "root", // Puedes omitirlo si siempre pasas site_id en params
+    // "SHAREPOINT_DEFAULT_DRIVE_NAME_OR_ID": "Documents", // Puedes omitirlo
+    "MEMORIA_LIST_NAME": "AsistenteMemoriaLocalDebug", // Nombre para tu lista de memoria en pruebas
+    "MAILBOX_USER_ID": "me", // Para acciones de correo/calendario sobre el usuario autenticado
+
+    // --- Autenticación para GitHub (Personal Access Token) ---
+    "GITHUB_PAT": "TU_GITHUB_PERSONAL_ACCESS_TOKEN_REAL", // Reemplaza. ¡No subir a Git!
+
+    // --- Autenticación para DefaultAzureCredential (Local - VÍA AZURE CLI / VS CODE) ---
+    // ¡IMPORTANTE! Para que DefaultAzureCredential funcione con tus credenciales de desarrollador:
+    // 1. ASEGÚRATE DE NO TENER las siguientes variables (AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID)
+    //    descomentadas o definidas aquí si quieres usar 'az login'.
+    // 2. Ejecuta 'az login' en tu terminal e inicia sesión.
+    //
+    // "AZURE_CLIENT_ID": "ID_DE_TU_APP_REGISTRATION_SI_USARAS_SERVICE_PRINCIPAL_LOCALMENTE",
+    // "AZURE_CLIENT_SECRET": "SECRETO_DE_TU_APP_REGISTRATION_SI_USARAS_SERVICE_PRINCIPAL_LOCALMENTE",
+    // "AZURE_TENANT_ID": "ID_DE_TU_TENANT_SI_USARAS_SERVICE_PRINCIPAL_LOCALMENTE",
+
+    // --- Credenciales para Power BI / Power Automate (SI USAN ClientSecretCredential directamente) ---
+    // Si power_bi_actions.py o power_automate_actions.py AÚN usan ClientSecretCredential
+    // directamente en lugar de AuthenticatedHttpClient con DefaultAzureCredential, necesitarás
+    // configurar sus credenciales específicas aquí. Si ya los refactorizaste para usar
+    // AuthenticatedHttpClient (con PBI_SCOPE_DEFAULT o AZURE_MGMT_SCOPE_DEFAULT),
+    // y DefaultAzureCredential funciona con 'az login', entonces estas variables NO son necesarias.
+    // "PBI_TENANT_ID": "...",
+    // "PBI_CLIENT_ID": "...",
+    // "PBI_CLIENT_SECRET": "...", // ¡No subir a Git!
+    // "AZURE_CLIENT_ID_MGMT": "...", // Para Power Automate
+    // "AZURE_CLIENT_SECRET_MGMT": "...", // ¡No subir a Git!
+    // "AZURE_SUBSCRIPTION_ID": "...", // Para Power Automate
+    // "AZURE_RESOURCE_GROUP": "..."   // Para Power Automate
+  },
+  "ConnectionStrings": {}
+}

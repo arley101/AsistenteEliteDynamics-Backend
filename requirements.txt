@@ -1,0 +1,17 @@
+# ====== Dependencias Principales ======
+azure-functions==1.19.0
+azure-identity==1.16.0
+requests==2.31.0
+python-dotenv==1.0.1
+
+# ====== Workaround RECOMENDADO POR MICROSOFT ======
+# Soluciona el error "ModuleNotFoundError: cryptography.hazmat.bindings._rust"
+# o similares, causados por cambios en el runtime Linux de Azure Functions.
+# Referencia: https://github.com/Azure/azure-sdk-for-python/issues/38725
+cryptography==43.0.3
+
+# ====== Notas ======
+# Las dependencias transitivas (como azure-core, urllib3, etc.)
+# serán instaladas automáticamente por pip basándose en las versiones
+# requeridas por las librerías principales listadas arriba.
+# Se ha eliminado 'msal' ya que la autenticación se maneja ahora con 'azure-identity'.
